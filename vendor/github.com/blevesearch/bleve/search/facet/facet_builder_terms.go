@@ -15,11 +15,19 @@
 package facet
 
 import (
+	"reflect"
 	"sort"
 
-	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/size"
 )
+
+var reflectStaticSizeTermsFacetBuilder int
+
+func init() {
+	var tfb TermsFacetBuilder
+	reflectStaticSizeTermsFacetBuilder = int(reflect.TypeOf(tfb).Size())
+}
 
 type TermsFacetBuilder struct {
 	size       int
@@ -27,6 +35,7 @@ type TermsFacetBuilder struct {
 	termsCount map[string]int
 	total      int
 	missing    int
+	sawValue   bool
 }
 
 func NewTermsFacetBuilder(field string, size int) *TermsFacetBuilder {
@@ -37,23 +46,36 @@ func NewTermsFacetBuilder(field string, size int) *TermsFacetBuilder {
 	}
 }
 
+func (fb *TermsFacetBuilder) Size() int {
+	sizeInBytes := reflectStaticSizeTermsFacetBuilder + size.SizeOfPtr +
+		len(fb.field)
+
+	for k, _ := range fb.termsCount {
+		sizeInBytes += size.SizeOfString + len(k) +
+			size.SizeOfInt
+	}
+
+	return sizeInBytes
+}
+
 func (fb *TermsFacetBuilder) Field() string {
 	return fb.field
 }
 
-func (fb *TermsFacetBuilder) Update(ft index.FieldTerms) {
-	terms, ok := ft[fb.field]
-	if ok {
-		for _, term := range terms {
-			existingCount, existed := fb.termsCount[term]
-			if existed {
-				fb.termsCount[term] = existingCount + 1
-			} else {
-				fb.termsCount[term] = 1
-			}
-			fb.total++
-		}
-	} else {
+func (fb *TermsFacetBuilder) UpdateVisitor(field string, term []byte) {
+	if field == fb.field {
+		fb.sawValue = true
+		fb.termsCount[string(term)] = fb.termsCount[string(term)] + 1
+		fb.total++
+	}
+}
+
+func (fb *TermsFacetBuilder) StartDoc() {
+	fb.sawValue = false
+}
+
+func (fb *TermsFacetBuilder) EndDoc() {
+	if !fb.sawValue {
 		fb.missing++
 	}
 }

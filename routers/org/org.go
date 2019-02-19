@@ -1,4 +1,5 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -23,8 +24,9 @@ const (
 // Create render the page for create organization
 func Create(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("new_org")
+	ctx.Data["DefaultOrgVisibilityMode"] = setting.Service.DefaultOrgVisibilityMode
 	if !ctx.User.CanCreateOrganization() {
-		ctx.Handle(500, "Not allowed", errors.New(ctx.Tr("org.form.create_org_not_allowed")))
+		ctx.ServerError("Not allowed", errors.New(ctx.Tr("org.form.create_org_not_allowed")))
 		return
 	}
 	ctx.HTML(200, tplCreateOrg)
@@ -34,15 +36,21 @@ func Create(ctx *context.Context) {
 func CreatePost(ctx *context.Context, form auth.CreateOrgForm) {
 	ctx.Data["Title"] = ctx.Tr("new_org")
 
+	if !ctx.User.CanCreateOrganization() {
+		ctx.ServerError("Not allowed", errors.New(ctx.Tr("org.form.create_org_not_allowed")))
+		return
+	}
+
 	if ctx.HasError() {
 		ctx.HTML(200, tplCreateOrg)
 		return
 	}
 
 	org := &models.User{
-		Name:     form.OrgName,
-		IsActive: true,
-		Type:     models.UserTypeOrganization,
+		Name:       form.OrgName,
+		IsActive:   true,
+		Type:       models.UserTypeOrganization,
+		Visibility: form.Visibility,
 	}
 
 	if err := models.CreateOrganization(org, ctx.User); err != nil {
@@ -57,7 +65,7 @@ func CreatePost(ctx *context.Context, form auth.CreateOrgForm) {
 		case models.IsErrUserNotAllowedCreateOrg(err):
 			ctx.RenderWithErr(ctx.Tr("org.form.create_org_not_allowed"), tplCreateOrg, &form)
 		default:
-			ctx.Handle(500, "CreateOrganization", err)
+			ctx.ServerError("CreateOrganization", err)
 		}
 		return
 	}

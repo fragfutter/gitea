@@ -15,26 +15,118 @@
 package searcher
 
 import (
+	"fmt"
 	"math"
+	"reflect"
 
 	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/size"
 )
 
+var reflectStaticSizePhraseSearcher int
+
+func init() {
+	var ps PhraseSearcher
+	reflectStaticSizePhraseSearcher = int(reflect.TypeOf(ps).Size())
+}
+
 type PhraseSearcher struct {
-	indexReader  index.IndexReader
-	mustSearcher *ConjunctionSearcher
+	mustSearcher search.Searcher
 	queryNorm    float64
 	currMust     *search.DocumentMatch
-	slop         int
-	terms        []string
+	terms        [][]string
+	path         phrasePath
+	paths        []phrasePath
+	locations    []search.Location
 	initialized  bool
 }
 
-func NewPhraseSearcher(indexReader index.IndexReader, mustSearcher *ConjunctionSearcher, terms []string) (*PhraseSearcher, error) {
+func (s *PhraseSearcher) Size() int {
+	sizeInBytes := reflectStaticSizePhraseSearcher + size.SizeOfPtr
+
+	if s.mustSearcher != nil {
+		sizeInBytes += s.mustSearcher.Size()
+	}
+
+	if s.currMust != nil {
+		sizeInBytes += s.currMust.Size()
+	}
+
+	for _, entry := range s.terms {
+		sizeInBytes += size.SizeOfSlice
+		for _, entry1 := range entry {
+			sizeInBytes += size.SizeOfString + len(entry1)
+		}
+	}
+
+	return sizeInBytes
+}
+
+func NewPhraseSearcher(indexReader index.IndexReader, terms []string, field string, options search.SearcherOptions) (*PhraseSearcher, error) {
+	// turn flat terms []string into [][]string
+	mterms := make([][]string, len(terms))
+	for i, term := range terms {
+		mterms[i] = []string{term}
+	}
+	return NewMultiPhraseSearcher(indexReader, mterms, field, options)
+}
+
+func NewMultiPhraseSearcher(indexReader index.IndexReader, terms [][]string, field string, options search.SearcherOptions) (*PhraseSearcher, error) {
+	options.IncludeTermVectors = true
+	var termPositionSearchers []search.Searcher
+	for _, termPos := range terms {
+		if len(termPos) == 1 && termPos[0] != "" {
+			// single term
+			ts, err := NewTermSearcher(indexReader, termPos[0], field, 1.0, options)
+			if err != nil {
+				// close any searchers already opened
+				for _, ts := range termPositionSearchers {
+					_ = ts.Close()
+				}
+				return nil, fmt.Errorf("phrase searcher error building term searcher: %v", err)
+			}
+			termPositionSearchers = append(termPositionSearchers, ts)
+		} else if len(termPos) > 1 {
+			// multiple terms
+			var termSearchers []search.Searcher
+			for _, term := range termPos {
+				if term == "" {
+					continue
+				}
+				ts, err := NewTermSearcher(indexReader, term, field, 1.0, options)
+				if err != nil {
+					// close any searchers already opened
+					for _, ts := range termPositionSearchers {
+						_ = ts.Close()
+					}
+					return nil, fmt.Errorf("phrase searcher error building term searcher: %v", err)
+				}
+				termSearchers = append(termSearchers, ts)
+			}
+			disjunction, err := NewDisjunctionSearcher(indexReader, termSearchers, 1, options)
+			if err != nil {
+				// close any searchers already opened
+				for _, ts := range termPositionSearchers {
+					_ = ts.Close()
+				}
+				return nil, fmt.Errorf("phrase searcher error building term position disjunction searcher: %v", err)
+			}
+			termPositionSearchers = append(termPositionSearchers, disjunction)
+		}
+	}
+
+	mustSearcher, err := NewConjunctionSearcher(indexReader, termPositionSearchers, options)
+	if err != nil {
+		// close any searchers already opened
+		for _, ts := range termPositionSearchers {
+			_ = ts.Close()
+		}
+		return nil, fmt.Errorf("phrase searcher error building conjunction searcher: %v", err)
+	}
+
 	// build our searcher
 	rv := PhraseSearcher{
-		indexReader:  indexReader,
 		mustSearcher: mustSearcher,
 		terms:        terms,
 	}
@@ -71,6 +163,9 @@ func (s *PhraseSearcher) advanceNextMust(ctx *search.SearchContext) error {
 	var err error
 
 	if s.mustSearcher != nil {
+		if s.currMust != nil {
+			ctx.DocumentMatchPool.Put(s.currMust)
+		}
 		s.currMust, err = s.mustSearcher.Next(ctx)
 		if err != nil {
 			return err
@@ -96,66 +191,202 @@ func (s *PhraseSearcher) Next(ctx *search.SearchContext) (*search.DocumentMatch,
 		}
 	}
 
-	var rv *search.DocumentMatch
 	for s.currMust != nil {
-		rvftlm := make(search.FieldTermLocationMap, 0)
-		freq := 0
-		firstTerm := s.terms[0]
-		for field, termLocMap := range s.currMust.Locations {
-			rvtlm := make(search.TermLocationMap, 0)
-			locations, ok := termLocMap[firstTerm]
-			if ok {
-			OUTER:
-				for _, location := range locations {
-					crvtlm := make(search.TermLocationMap, 0)
-				INNER:
-					for i := 0; i < len(s.terms); i++ {
-						nextTerm := s.terms[i]
-						if nextTerm != "" {
-							// look through all these term locations
-							// to try and find the correct offsets
-							nextLocations, ok := termLocMap[nextTerm]
-							if ok {
-								for _, nextLocation := range nextLocations {
-									if nextLocation.Pos == location.Pos+float64(i) && nextLocation.SameArrayElement(location) {
-										// found a location match for this term
-										crvtlm.AddLocation(nextTerm, nextLocation)
-										continue INNER
-									}
-								}
-								// if we got here we didn't find a location match for this term
-								continue OUTER
-							} else {
-								continue OUTER
-							}
-						}
-					}
-					// if we got here all the terms matched
-					freq++
-					search.MergeTermLocationMaps(rvtlm, crvtlm)
-					rvftlm[field] = rvtlm
-				}
-			}
-		}
+		// check this match against phrase constraints
+		rv := s.checkCurrMustMatch(ctx)
 
-		if freq > 0 {
-			// return match
-			rv = s.currMust
-			rv.Locations = rvftlm
-			err := s.advanceNextMust(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return rv, nil
-		}
-
+		// prepare for next iteration (either loop or subsequent call to Next())
 		err := s.advanceNextMust(ctx)
 		if err != nil {
 			return nil, err
 		}
+
+		// if match satisfied phrase constraints return it as a hit
+		if rv != nil {
+			return rv, nil
+		}
 	}
 
 	return nil, nil
+}
+
+// checkCurrMustMatch is solely concerned with determining if the DocumentMatch
+// pointed to by s.currMust (which satisifies the pre-condition searcher)
+// also satisfies the phase constraints.  if so, it returns a DocumentMatch
+// for this document, otherwise nil
+func (s *PhraseSearcher) checkCurrMustMatch(ctx *search.SearchContext) *search.DocumentMatch {
+	s.locations = s.currMust.Complete(s.locations)
+
+	locations := s.currMust.Locations
+	s.currMust.Locations = nil
+
+	ftls := s.currMust.FieldTermLocations
+
+	// typically we would expect there to only actually be results in
+	// one field, but we allow for this to not be the case
+	// but, we note that phrase constraints can only be satisfied within
+	// a single field, so we can check them each independently
+	for field, tlm := range locations {
+		ftls = s.checkCurrMustMatchField(ctx, field, tlm, ftls)
+	}
+
+	if len(ftls) > 0 {
+		// return match
+		rv := s.currMust
+		s.currMust = nil
+		rv.FieldTermLocations = ftls
+		return rv
+	}
+
+	return nil
+}
+
+// checkCurrMustMatchField is solely concerned with determining if one
+// particular field within the currMust DocumentMatch Locations
+// satisfies the phase constraints (possibly more than once).  if so,
+// the matching field term locations are appended to the provided
+// slice
+func (s *PhraseSearcher) checkCurrMustMatchField(ctx *search.SearchContext,
+	field string, tlm search.TermLocationMap,
+	ftls []search.FieldTermLocation) []search.FieldTermLocation {
+	if s.path == nil {
+		s.path = make(phrasePath, 0, len(s.terms))
+	}
+	s.paths = findPhrasePaths(0, nil, s.terms, tlm, s.path[:0], 0, s.paths[:0])
+	for _, p := range s.paths {
+		for _, pp := range p {
+			ftls = append(ftls, search.FieldTermLocation{
+				Field: field,
+				Term:  pp.term,
+				Location: search.Location{
+					Pos:            pp.loc.Pos,
+					Start:          pp.loc.Start,
+					End:            pp.loc.End,
+					ArrayPositions: pp.loc.ArrayPositions,
+				},
+			})
+		}
+	}
+	return ftls
+}
+
+type phrasePart struct {
+	term string
+	loc  *search.Location
+}
+
+func (p *phrasePart) String() string {
+	return fmt.Sprintf("[%s %v]", p.term, p.loc)
+}
+
+type phrasePath []phrasePart
+
+func (p phrasePath) MergeInto(in search.TermLocationMap) {
+	for _, pp := range p {
+		in[pp.term] = append(in[pp.term], pp.loc)
+	}
+}
+
+func (p phrasePath) String() string {
+	rv := "["
+	for i, pp := range p {
+		if i > 0 {
+			rv += ", "
+		}
+		rv += pp.String()
+	}
+	rv += "]"
+	return rv
+}
+
+// findPhrasePaths is a function to identify phase matches from a set
+// of known term locations.  it recursive so care must be taken with
+// arguments and return values.
+//
+// prevPos - the previous location, 0 on first invocation
+// ap - array positions of the first candidate phrase part to
+//      which further recursive phrase parts must match,
+//      nil on initial invocation or when there are no array positions
+// phraseTerms - slice containing the phrase terms,
+//               may contain empty string as placeholder (don't care)
+// tlm - the Term Location Map containing all relevant term locations
+// p - the current path being explored (appended to in recursive calls)
+//     this is the primary state being built during the traversal
+// remainingSlop - amount of sloppiness that's allowed, which is the
+//        sum of the editDistances from each matching phrase part,
+//        where 0 means no sloppiness allowed (all editDistances must be 0),
+//        decremented during recursion
+// rv - the final result being appended to by all the recursive calls
+//
+// returns slice of paths, or nil if invocation did not find any successul paths
+func findPhrasePaths(prevPos uint64, ap search.ArrayPositions, phraseTerms [][]string,
+	tlm search.TermLocationMap, p phrasePath, remainingSlop int, rv []phrasePath) []phrasePath {
+	// no more terms
+	if len(phraseTerms) < 1 {
+		// snapshot or copy the recursively built phrasePath p and
+		// append it to the rv, also optimizing by checking if next
+		// phrasePath item in the rv (which we're about to overwrite)
+		// is available for reuse
+		var pcopy phrasePath
+		if len(rv) < cap(rv) {
+			pcopy = rv[:len(rv)+1][len(rv)][:0]
+		}
+		return append(rv, append(pcopy, p...))
+	}
+
+	car := phraseTerms[0]
+	cdr := phraseTerms[1:]
+
+	// empty term is treated as match (continue)
+	if len(car) == 0 || (len(car) == 1 && car[0] == "") {
+		nextPos := prevPos + 1
+		if prevPos == 0 {
+			// if prevPos was 0, don't set it to 1 (as thats not a real abs pos)
+			nextPos = 0 // don't advance nextPos if prevPos was 0
+		}
+		return findPhrasePaths(nextPos, ap, cdr, tlm, p, remainingSlop, rv)
+	}
+
+	// locations for this term
+	for _, carTerm := range car {
+		locations := tlm[carTerm]
+	LOCATIONS_LOOP:
+		for _, loc := range locations {
+			if prevPos != 0 && !loc.ArrayPositions.Equals(ap) {
+				// if the array positions are wrong, can't match, try next location
+				continue
+			}
+
+			// compute distance from previous phrase term
+			dist := 0
+			if prevPos != 0 {
+				dist = editDistance(prevPos+1, loc.Pos)
+			}
+
+			// if enough slop remaining, continue recursively
+			if prevPos == 0 || (remainingSlop-dist) >= 0 {
+				// skip if we've already used this term+loc already
+				for _, ppart := range p {
+					if ppart.term == carTerm && ppart.loc == loc {
+						continue LOCATIONS_LOOP
+					}
+				}
+
+				// this location works, add it to the path (but not for empty term)
+				px := append(p, phrasePart{term: carTerm, loc: loc})
+				rv = findPhrasePaths(loc.Pos, loc.ArrayPositions, cdr, tlm, px, remainingSlop-dist, rv)
+			}
+		}
+	}
+	return rv
+}
+
+func editDistance(p1, p2 uint64) int {
+	dist := int(p1 - p2)
+	if dist < 0 {
+		return -dist
+	}
+	return dist
 }
 
 func (s *PhraseSearcher) Advance(ctx *search.SearchContext, ID index.IndexInternalID) (*search.DocumentMatch, error) {
@@ -164,6 +395,15 @@ func (s *PhraseSearcher) Advance(ctx *search.SearchContext, ID index.IndexIntern
 		if err != nil {
 			return nil, err
 		}
+	}
+	if s.currMust != nil {
+		if s.currMust.IndexInternalID.Compare(ID) >= 0 {
+			return s.Next(ctx)
+		}
+		ctx.DocumentMatchPool.Put(s.currMust)
+	}
+	if s.currMust == nil {
+		return nil, nil
 	}
 	var err error
 	s.currMust, err = s.mustSearcher.Advance(ctx, ID)

@@ -14,6 +14,17 @@
 
 package search
 
+import (
+	"reflect"
+)
+
+var reflectStaticSizeDocumentMatchPool int
+
+func init() {
+	var dmp DocumentMatchPool
+	reflectStaticSizeDocumentMatchPool = int(reflect.TypeOf(dmp).Size())
+}
+
 // DocumentMatchPoolTooSmall is a callback function that can be executed
 // when the DocumentMatchPool does not have sufficient capacity
 // By default we just perform just-in-time allocation, but you could log
@@ -37,13 +48,17 @@ func defaultDocumentMatchPoolTooSmall(p *DocumentMatchPool) *DocumentMatch {
 // pre-allocated to accommodate the requested number of DocumentMatch
 // instances
 func NewDocumentMatchPool(size, sortsize int) *DocumentMatchPool {
-	avail := make(DocumentMatchCollection, 0, size)
+	avail := make(DocumentMatchCollection, size)
 	// pre-allocate the expected number of instances
 	startBlock := make([]DocumentMatch, size)
+	startSorts := make([]string, size*sortsize)
 	// make these initial instances available
-	for i := range startBlock {
-		startBlock[i].Sort = make([]string, 0, sortsize)
-		avail = append(avail, &startBlock[i])
+	i, j := 0, 0
+	for i < size {
+		avail[i] = &startBlock[i]
+		avail[i].Sort = startSorts[j:j]
+		i += 1
+		j += sortsize
 	}
 	return &DocumentMatchPool{
 		avail:    avail,

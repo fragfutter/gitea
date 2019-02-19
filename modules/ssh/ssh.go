@@ -1,10 +1,15 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2017 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
 package ssh
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"io"
 	"io/ioutil"
 	"net"
@@ -135,9 +140,9 @@ func listen(config *ssh.ServerConfig, host string, port int) {
 			sConn, chans, reqs, err := ssh.NewServerConn(conn, config)
 			if err != nil {
 				if err == io.EOF {
-					log.Warn("SSH: Handshaking was terminated: %v", err)
+					log.Warn("SSH: Handshaking with %s was terminated: %v", conn.RemoteAddr(), err)
 				} else {
-					log.Error(3, "SSH: Error on handshaking: %v", err)
+					log.Error(3, "SSH: Error on handshaking with %s: %v", conn.RemoteAddr(), err)
 				}
 				return
 			}
@@ -151,8 +156,13 @@ func listen(config *ssh.ServerConfig, host string, port int) {
 }
 
 // Listen starts a SSH server listens on given port.
-func Listen(host string, port int) {
+func Listen(host string, port int, ciphers []string, keyExchanges []string, macs []string) {
 	config := &ssh.ServerConfig{
+		Config: ssh.Config{
+			Ciphers:      ciphers,
+			KeyExchanges: keyExchanges,
+			MACs:         macs,
+		},
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			pkey, err := models.SearchPublicKeyByContent(strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))))
 			if err != nil {
@@ -171,9 +181,9 @@ func Listen(host string, port int) {
 			log.Error(4, "Failed to create dir %s: %v", filePath, err)
 		}
 
-		_, stderr, err := com.ExecCmd("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "")
+		err := GenKeyPair(keyPath)
 		if err != nil {
-			log.Fatal(4, "Failed to generate private key: %v - %s", err, stderr)
+			log.Fatal(4, "Failed to generate private key: %v", err)
 		}
 		log.Trace("SSH: New private key is generateed: %s", keyPath)
 	}
@@ -189,4 +199,40 @@ func Listen(host string, port int) {
 	config.AddHostKey(private)
 
 	go listen(config, host, port)
+}
+
+// GenKeyPair make a pair of public and private keys for SSH access.
+// Public key is encoded in the format for inclusion in an OpenSSH authorized_keys file.
+// Private Key generated is PEM encoded
+func GenKeyPair(keyPath string) error {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}
+	f, err := os.OpenFile(keyPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := pem.Encode(f, privateKeyPEM); err != nil {
+		return err
+	}
+
+	// generate public key
+	pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return err
+	}
+
+	public := ssh.MarshalAuthorizedKey(pub)
+	p, err := os.OpenFile(keyPath+".pub", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	defer p.Close()
+	_, err = p.Write(public)
+	return err
 }

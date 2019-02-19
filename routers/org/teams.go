@@ -6,6 +6,7 @@ package org
 
 import (
 	"path"
+	"strings"
 
 	"github.com/Unknwon/com"
 
@@ -14,6 +15,7 @@ import (
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/log"
+	"code.gitea.io/gitea/routers/utils"
 )
 
 const (
@@ -35,7 +37,7 @@ func Teams(ctx *context.Context) {
 
 	for _, t := range org.Teams {
 		if err := t.GetMembers(); err != nil {
-			ctx.Handle(500, "GetMembers", err)
+			ctx.ServerError("GetMembers", err)
 			return
 		}
 	}
@@ -75,7 +77,7 @@ func TeamsAction(ctx *context.Context) {
 			ctx.Error(404)
 			return
 		}
-		uname := ctx.Query("uname")
+		uname := utils.RemoveUsernameParameterSuffix(strings.ToLower(ctx.Query("uname")))
 		var u *models.User
 		u, err = models.GetUserByName(uname)
 		if err != nil {
@@ -83,7 +85,7 @@ func TeamsAction(ctx *context.Context) {
 				ctx.Flash.Error(ctx.Tr("form.user_not_exist"))
 				ctx.Redirect(ctx.Org.OrgLink + "/teams/" + ctx.Org.Team.LowerName)
 			} else {
-				ctx.Handle(500, " GetUserByName", err)
+				ctx.ServerError(" GetUserByName", err)
 			}
 			return
 		}
@@ -94,7 +96,12 @@ func TeamsAction(ctx *context.Context) {
 			return
 		}
 
-		err = ctx.Org.Team.AddMember(u.ID)
+		if ctx.Org.Team.IsMember(u.ID) {
+			ctx.Flash.Error(ctx.Tr("org.teams.add_duplicate_users"))
+		} else {
+			err = ctx.Org.Team.AddMember(u.ID)
+		}
+
 		page = "team"
 	}
 
@@ -140,7 +147,7 @@ func TeamsRepoAction(ctx *context.Context) {
 				ctx.Redirect(ctx.Org.OrgLink + "/teams/" + ctx.Org.Team.LowerName + "/repositories")
 				return
 			}
-			ctx.Handle(500, "GetRepositoryByName", err)
+			ctx.ServerError("GetRepositoryByName", err)
 			return
 		}
 		err = ctx.Org.Team.AddRepository(repo)
@@ -150,7 +157,7 @@ func TeamsRepoAction(ctx *context.Context) {
 
 	if err != nil {
 		log.Error(3, "Action(%s): '%s' %v", ctx.Params(":action"), ctx.Org.Team.Name, err)
-		ctx.Handle(500, "TeamsRepoAction", err)
+		ctx.ServerError("TeamsRepoAction", err)
 		return
 	}
 	ctx.Redirect(ctx.Org.OrgLink + "/teams/" + ctx.Org.Team.LowerName + "/repositories")
@@ -179,8 +186,16 @@ func NewTeamPost(ctx *context.Context, form auth.CreateTeamForm) {
 		Description: form.Description,
 		Authorize:   models.ParseAccessMode(form.Permission),
 	}
-	if t.Authorize < models.AccessModeAdmin {
-		t.UnitTypes = form.Units
+
+	if t.Authorize < models.AccessModeOwner {
+		var units = make([]*models.TeamUnit, 0, len(form.Units))
+		for _, tp := range form.Units {
+			units = append(units, &models.TeamUnit{
+				OrgID: ctx.Org.Organization.ID,
+				Type:  tp,
+			})
+		}
+		t.Units = units
 	}
 
 	ctx.Data["Team"] = t
@@ -201,7 +216,7 @@ func NewTeamPost(ctx *context.Context, form auth.CreateTeamForm) {
 		case models.IsErrTeamAlreadyExist(err):
 			ctx.RenderWithErr(ctx.Tr("form.team_name_been_taken"), tplTeamNew, &form)
 		default:
-			ctx.Handle(500, "NewTeam", err)
+			ctx.ServerError("NewTeam", err)
 		}
 		return
 	}
@@ -213,8 +228,9 @@ func NewTeamPost(ctx *context.Context, form auth.CreateTeamForm) {
 func TeamMembers(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Org.Team.Name
 	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["PageIsOrgTeamMembers"] = true
 	if err := ctx.Org.Team.GetMembers(); err != nil {
-		ctx.Handle(500, "GetMembers", err)
+		ctx.ServerError("GetMembers", err)
 		return
 	}
 	ctx.HTML(200, tplTeamMembers)
@@ -224,8 +240,9 @@ func TeamMembers(ctx *context.Context) {
 func TeamRepositories(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Org.Team.Name
 	ctx.Data["PageIsOrgTeams"] = true
+	ctx.Data["PageIsOrgTeamRepos"] = true
 	if err := ctx.Org.Team.GetRepositories(); err != nil {
-		ctx.Handle(500, "GetRepositories", err)
+		ctx.ServerError("GetRepositories", err)
 		return
 	}
 	ctx.HTML(200, tplTeamRepositories)
@@ -261,10 +278,18 @@ func EditTeamPost(ctx *context.Context, form auth.CreateTeamForm) {
 		}
 	}
 	t.Description = form.Description
-	if t.Authorize < models.AccessModeAdmin {
-		t.UnitTypes = form.Units
+	if t.Authorize < models.AccessModeOwner {
+		var units = make([]models.TeamUnit, 0, len(form.Units))
+		for _, tp := range form.Units {
+			units = append(units, models.TeamUnit{
+				OrgID:  t.OrgID,
+				TeamID: t.ID,
+				Type:   tp,
+			})
+		}
+		models.UpdateTeamUnits(t, units)
 	} else {
-		t.UnitTypes = nil
+		models.UpdateTeamUnits(t, nil)
 	}
 
 	if ctx.HasError() {
@@ -283,7 +308,7 @@ func EditTeamPost(ctx *context.Context, form auth.CreateTeamForm) {
 		case models.IsErrTeamAlreadyExist(err):
 			ctx.RenderWithErr(ctx.Tr("form.team_name_been_taken"), tplTeamNew, &form)
 		default:
-			ctx.Handle(500, "UpdateTeam", err)
+			ctx.ServerError("UpdateTeam", err)
 		}
 		return
 	}

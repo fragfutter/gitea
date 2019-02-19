@@ -4,6 +4,10 @@
 
 package models
 
+import (
+	"strings"
+)
+
 // UnitType is Unit's Type
 type UnitType int
 
@@ -58,6 +62,14 @@ type Unit struct {
 // CanDisable returns if this unit could be disabled.
 func (u *Unit) CanDisable() bool {
 	return true
+}
+
+// IsLessThan compares order of two units
+func (u Unit) IsLessThan(unit Unit) bool {
+	if (u.Type == UnitTypeExternalTracker || u.Type == UnitTypeExternalWiki) && unit.Type != UnitTypeExternalTracker && unit.Type != UnitTypeExternalWiki {
+		return false
+	}
+	return u.Idx < unit.Idx
 }
 
 // Enumerate all the units
@@ -129,3 +141,16 @@ var (
 		UnitTypeExternalWiki:    UnitExternalWiki,
 	}
 )
+
+// FindUnitTypes give the unit key name and return unit
+func FindUnitTypes(nameKeys ...string) (res []UnitType) {
+	for _, key := range nameKeys {
+		for t, u := range Units {
+			if strings.EqualFold(key, u.NameKey) {
+				res = append(res, t)
+				break
+			}
+		}
+	}
+	return
+}

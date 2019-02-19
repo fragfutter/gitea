@@ -11,57 +11,61 @@ import (
 )
 
 // listUserRepos - List the repositories owned by the given user.
-func listUserRepos(ctx *context.APIContext, u *models.User) {
-	showPrivateRepos := ctx.IsSigned && (ctx.User.ID == u.ID || ctx.User.IsAdmin)
-	repos, err := models.GetUserRepositories(u.ID, showPrivateRepos, 1, u.NumRepos, "")
+func listUserRepos(ctx *context.APIContext, u *models.User, private bool) {
+	repos, err := models.GetUserRepositories(u.ID, private, 1, u.NumRepos, "")
 	if err != nil {
 		ctx.Error(500, "GetUserRepositories", err)
 		return
 	}
-	apiRepos := make([]*api.Repository, len(repos))
-	var ctxUserID int64
-	if ctx.User != nil {
-		ctxUserID = ctx.User.ID
-	}
+
+	apiRepos := make([]*api.Repository, 0, len(repos))
 	for i := range repos {
-		access, err := models.AccessLevel(ctxUserID, repos[i])
+		access, err := models.AccessLevel(ctx.User, repos[i])
 		if err != nil {
 			ctx.Error(500, "AccessLevel", err)
 			return
 		}
-		apiRepos[i] = repos[i].APIFormat(access)
+		if ctx.IsSigned && ctx.User.IsAdmin || access >= models.AccessModeRead {
+			apiRepos = append(apiRepos, repos[i].APIFormat(access))
+		}
 	}
 	ctx.JSON(200, &apiRepos)
 }
 
 // ListUserRepos - list the repos owned by the given user.
 func ListUserRepos(ctx *context.APIContext) {
-	// swagger:route GET /users/{username}/repos userListRepos
-	//
-	//     Produces:
-	//     - application/json
-	//
-	//     Responses:
-	//       200: RepositoryList
-	//       500: error
-
+	// swagger:operation GET /users/{username}/repos user userListRepos
+	// ---
+	// summary: List the repos owned by the given user
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: username
+	//   in: path
+	//   description: username of user
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/RepositoryList"
 	user := GetUserByParams(ctx)
 	if ctx.Written() {
 		return
 	}
-	listUserRepos(ctx, user)
+	private := ctx.IsSigned && (ctx.User.ID == user.ID || ctx.User.IsAdmin)
+	listUserRepos(ctx, user, private)
 }
 
 // ListMyRepos - list the repositories you own or have access to.
 func ListMyRepos(ctx *context.APIContext) {
-	// swagger:route GET /user/repos userCurrentListRepos
-	//
-	//     Produces:
-	//     - application/json
-	//
-	//     Responses:
-	//       200: RepositoryList
-	//       500: error
+	// swagger:operation GET /user/repos user userCurrentListRepos
+	// ---
+	// summary: List the repos that the authenticated user owns or has access to
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/RepositoryList"
 	ownRepos, err := models.GetUserRepositories(ctx.User.ID, true, 1, ctx.User.NumRepos, "")
 	if err != nil {
 		ctx.Error(500, "GetUserRepositories", err)
@@ -87,14 +91,19 @@ func ListMyRepos(ctx *context.APIContext) {
 
 // ListOrgRepos - list the repositories of an organization.
 func ListOrgRepos(ctx *context.APIContext) {
-	// swagger:route GET /orgs/{org}/repos orgListRepos
-	//
-	//     Produces:
-	//     - application/json
-	//
-	//     Responses:
-	//       200: RepositoryList
-	//       500: error
-
-	listUserRepos(ctx, ctx.Org.Organization)
+	// swagger:operation GET /orgs/{org}/repos organization orgListRepos
+	// ---
+	// summary: List an organization's repos
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: org
+	//   in: path
+	//   description: name of the organization
+	//   type: string
+	//   required: true
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/RepositoryList"
+	listUserRepos(ctx, ctx.Org.Organization, ctx.IsSigned)
 }

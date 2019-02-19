@@ -1,4 +1,5 @@
 // Copyright 2014 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -11,7 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
+
+	"code.gitea.io/gitea/modules/log"
+	"code.gitea.io/gitea/modules/setting"
 
 	// Needed for the MySQL driver
 	_ "github.com/go-sql-driver/mysql"
@@ -23,21 +28,18 @@ import (
 
 	// Needed for the MSSSQL driver
 	_ "github.com/denisenkom/go-mssqldb"
-
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/setting"
 )
 
 // Engine represents a xorm engine or session.
 type Engine interface {
 	Table(tableNameOrBean interface{}) *xorm.Session
-	Count(interface{}) (int64, error)
+	Count(...interface{}) (int64, error)
 	Decr(column string, arg ...interface{}) *xorm.Session
 	Delete(interface{}) (int64, error)
-	Exec(string, ...interface{}) (sql.Result, error)
+	Exec(...interface{}) (sql.Result, error)
 	Find(interface{}, ...interface{}) error
 	Get(interface{}) (bool, error)
-	Id(interface{}) *xorm.Session
+	ID(interface{}) *xorm.Session
 	In(string, ...interface{}) *xorm.Session
 	Incr(column string, arg ...interface{}) *xorm.Session
 	Insert(...interface{}) (int64, error)
@@ -112,6 +114,17 @@ func init() {
 		new(UserOpenID),
 		new(IssueWatch),
 		new(CommitStatus),
+		new(Stopwatch),
+		new(TrackedTime),
+		new(DeletedBranch),
+		new(RepoIndexerStatus),
+		new(IssueDependency),
+		new(LFSLock),
+		new(Reaction),
+		new(IssueAssignees),
+		new(U2FRegistration),
+		new(TeamUnit),
+		new(Review),
 	)
 
 	gonicNames := []string{"SSL", "UID"}
@@ -142,13 +155,22 @@ func LoadConfigs() {
 	if len(DbCfg.Passwd) == 0 {
 		DbCfg.Passwd = sec.Key("PASSWD").String()
 	}
-	DbCfg.SSLMode = sec.Key("SSL_MODE").String()
+	DbCfg.SSLMode = sec.Key("SSL_MODE").MustString("disable")
 	DbCfg.Path = sec.Key("PATH").MustString("data/gitea.db")
 	DbCfg.Timeout = sec.Key("SQLITE_TIMEOUT").MustInt(500)
 
 	sec = setting.Cfg.Section("indexer")
-	setting.Indexer.IssuePath = sec.Key("ISSUE_INDEXER_PATH").MustString("indexers/issues.bleve")
+	setting.Indexer.IssuePath = sec.Key("ISSUE_INDEXER_PATH").MustString(path.Join(setting.AppDataPath, "indexers/issues.bleve"))
+	if !filepath.IsAbs(setting.Indexer.IssuePath) {
+		setting.Indexer.IssuePath = path.Join(setting.AppWorkPath, setting.Indexer.IssuePath)
+	}
+	setting.Indexer.RepoIndexerEnabled = sec.Key("REPO_INDEXER_ENABLED").MustBool(false)
+	setting.Indexer.RepoPath = sec.Key("REPO_INDEXER_PATH").MustString(path.Join(setting.AppDataPath, "indexers/repos.bleve"))
+	if !filepath.IsAbs(setting.Indexer.RepoPath) {
+		setting.Indexer.RepoPath = path.Join(setting.AppWorkPath, setting.Indexer.RepoPath)
+	}
 	setting.Indexer.UpdateQueueLength = sec.Key("UPDATE_BUFFER_LEN").MustInt(20)
+	setting.Indexer.MaxIndexerFileSize = sec.Key("MAX_FILE_SIZE").MustInt64(1024 * 1024)
 }
 
 // parsePostgreSQLHostPort parses given input in various forms defined in
@@ -166,7 +188,20 @@ func parsePostgreSQLHostPort(info string) (string, string) {
 	return host, port
 }
 
-func parseMSSQLHostPort(info string) (string, string) {
+func getPostgreSQLConnectionString(DBHost, DBUser, DBPasswd, DBName, DBParam, DBSSLMode string) (connStr string) {
+	host, port := parsePostgreSQLHostPort(DBHost)
+	if host[0] == '/' { // looks like a unix socket
+		connStr = fmt.Sprintf("postgres://%s:%s@:%s/%s%ssslmode=%s&host=%s",
+			url.PathEscape(DBUser), url.PathEscape(DBPasswd), port, DBName, DBParam, DBSSLMode, host)
+	} else {
+		connStr = fmt.Sprintf("postgres://%s:%s@%s:%s/%s%ssslmode=%s",
+			url.PathEscape(DBUser), url.PathEscape(DBPasswd), host, port, DBName, DBParam, DBSSLMode)
+	}
+	return
+}
+
+// ParseMSSQLHostPort splits the host into host and port
+func ParseMSSQLHostPort(info string) (string, string) {
 	host, port := "127.0.0.1", "1433"
 	if strings.Contains(info, ":") {
 		host = strings.Split(info, ":")[0]
@@ -188,24 +223,20 @@ func getEngine() (*xorm.Engine, error) {
 	}
 	switch DbCfg.Type {
 	case "mysql":
+		connType := "tcp"
 		if DbCfg.Host[0] == '/' { // looks like a unix socket
-			connStr = fmt.Sprintf("%s:%s@unix(%s)/%s%scharset=utf8&parseTime=true",
-				DbCfg.User, DbCfg.Passwd, DbCfg.Host, DbCfg.Name, Param)
-		} else {
-			connStr = fmt.Sprintf("%s:%s@tcp(%s)/%s%scharset=utf8&parseTime=true",
-				DbCfg.User, DbCfg.Passwd, DbCfg.Host, DbCfg.Name, Param)
+			connType = "unix"
 		}
+		tls := DbCfg.SSLMode
+		if tls == "disable" { // allow (Postgres-inspired) default value to work in MySQL
+			tls = "false"
+		}
+		connStr = fmt.Sprintf("%s:%s@%s(%s)/%s%scharset=utf8&parseTime=true&tls=%s",
+			DbCfg.User, DbCfg.Passwd, connType, DbCfg.Host, DbCfg.Name, Param, tls)
 	case "postgres":
-		host, port := parsePostgreSQLHostPort(DbCfg.Host)
-		if host[0] == '/' { // looks like a unix socket
-			connStr = fmt.Sprintf("postgres://%s:%s@:%s/%s%ssslmode=%s&host=%s",
-				url.QueryEscape(DbCfg.User), url.QueryEscape(DbCfg.Passwd), port, DbCfg.Name, Param, DbCfg.SSLMode, host)
-		} else {
-			connStr = fmt.Sprintf("postgres://%s:%s@%s:%s/%s%ssslmode=%s",
-				url.QueryEscape(DbCfg.User), url.QueryEscape(DbCfg.Passwd), host, port, DbCfg.Name, Param, DbCfg.SSLMode)
-		}
+		connStr = getPostgreSQLConnectionString(DbCfg.Host, DbCfg.User, DbCfg.Passwd, DbCfg.Name, Param, DbCfg.SSLMode)
 	case "mssql":
-		host, port := parseMSSQLHostPort(DbCfg.Host)
+		host, port := ParseMSSQLHostPort(DbCfg.Host)
 		connStr = fmt.Sprintf("server=%s; port=%s; database=%s; user id=%s; password=%s;", host, port, DbCfg.Name, DbCfg.User, DbCfg.Passwd)
 	case "sqlite3":
 		if !EnableSQLite3 {
@@ -239,6 +270,7 @@ func NewTestEngine(x *xorm.Engine) (err error) {
 
 	x.SetMapper(core.GonicMapper{})
 	x.SetLogger(log.XORMLogger)
+	x.ShowSQL(!setting.ProdMode)
 	return x.StoreEngine("InnoDB").Sync2(tables...)
 }
 
@@ -253,7 +285,7 @@ func SetEngine() (err error) {
 	// WARNING: for serv command, MUST remove the output to os.stdout,
 	// so use log file to instead print to stdout.
 	x.SetLogger(log.XORMLogger)
-	x.ShowSQL(true)
+	x.ShowSQL(setting.LogSQL)
 	return nil
 }
 
@@ -318,7 +350,10 @@ func GetStatistic() (stats Statistic) {
 
 // Ping tests if database is alive
 func Ping() error {
-	return x.Ping()
+	if x != nil {
+		return x.Ping()
+	}
+	return errors.New("database not configured")
 }
 
 // DumpDatabase dumps all data from database according the special database SQL syntax to file system.

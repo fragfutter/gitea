@@ -15,13 +15,24 @@
 package facet
 
 import (
+	"reflect"
 	"sort"
 	"time"
 
-	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/numeric"
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/size"
 )
+
+var reflectStaticSizeDateTimeFacetBuilder int
+var reflectStaticSizedateTimeRange int
+
+func init() {
+	var dtfb DateTimeFacetBuilder
+	reflectStaticSizeDateTimeFacetBuilder = int(reflect.TypeOf(dtfb).Size())
+	var dtr dateTimeRange
+	reflectStaticSizedateTimeRange = int(reflect.TypeOf(dtr).Size())
+}
 
 type dateTimeRange struct {
 	start time.Time
@@ -35,6 +46,7 @@ type DateTimeFacetBuilder struct {
 	total      int
 	missing    int
 	ranges     map[string]*dateTimeRange
+	sawValue   bool
 }
 
 func NewDateTimeFacetBuilder(field string, size int) *DateTimeFacetBuilder {
@@ -44,6 +56,23 @@ func NewDateTimeFacetBuilder(field string, size int) *DateTimeFacetBuilder {
 		termsCount: make(map[string]int),
 		ranges:     make(map[string]*dateTimeRange, 0),
 	}
+}
+
+func (fb *DateTimeFacetBuilder) Size() int {
+	sizeInBytes := reflectStaticSizeDateTimeFacetBuilder + size.SizeOfPtr +
+		len(fb.field)
+
+	for k, _ := range fb.termsCount {
+		sizeInBytes += size.SizeOfString + len(k) +
+			size.SizeOfInt
+	}
+
+	for k, _ := range fb.ranges {
+		sizeInBytes += size.SizeOfString + len(k) +
+			size.SizeOfPtr + reflectStaticSizedateTimeRange
+	}
+
+	return sizeInBytes
 }
 
 func (fb *DateTimeFacetBuilder) AddRange(name string, start, end time.Time) {
@@ -58,36 +87,35 @@ func (fb *DateTimeFacetBuilder) Field() string {
 	return fb.field
 }
 
-func (fb *DateTimeFacetBuilder) Update(ft index.FieldTerms) {
-	terms, ok := ft[fb.field]
-	if ok {
-		for _, term := range terms {
-			// only consider the values which are shifted 0
-			prefixCoded := numeric.PrefixCoded(term)
-			shift, err := prefixCoded.Shift()
-			if err == nil && shift == 0 {
-				i64, err := prefixCoded.Int64()
-				if err == nil {
-					t := time.Unix(0, i64)
+func (fb *DateTimeFacetBuilder) UpdateVisitor(field string, term []byte) {
+	if field == fb.field {
+		fb.sawValue = true
+		// only consider the values which are shifted 0
+		prefixCoded := numeric.PrefixCoded(term)
+		shift, err := prefixCoded.Shift()
+		if err == nil && shift == 0 {
+			i64, err := prefixCoded.Int64()
+			if err == nil {
+				t := time.Unix(0, i64)
 
-					// look at each of the ranges for a match
-					for rangeName, r := range fb.ranges {
-
-						if (r.start.IsZero() || t.After(r.start) || t.Equal(r.start)) && (r.end.IsZero() || t.Before(r.end)) {
-
-							existingCount, existed := fb.termsCount[rangeName]
-							if existed {
-								fb.termsCount[rangeName] = existingCount + 1
-							} else {
-								fb.termsCount[rangeName] = 1
-							}
-							fb.total++
-						}
+				// look at each of the ranges for a match
+				for rangeName, r := range fb.ranges {
+					if (r.start.IsZero() || t.After(r.start) || t.Equal(r.start)) && (r.end.IsZero() || t.Before(r.end)) {
+						fb.termsCount[rangeName] = fb.termsCount[rangeName] + 1
+						fb.total++
 					}
 				}
 			}
 		}
-	} else {
+	}
+}
+
+func (fb *DateTimeFacetBuilder) StartDoc() {
+	fb.sawValue = false
+}
+
+func (fb *DateTimeFacetBuilder) EndDoc() {
+	if !fb.sawValue {
 		fb.missing++
 	}
 }

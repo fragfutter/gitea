@@ -25,20 +25,29 @@ type collectStoreHeap struct {
 	compare collectorCompare
 }
 
-func newStoreHeap(cap int, compare collectorCompare) *collectStoreHeap {
+func newStoreHeap(capacity int, compare collectorCompare) *collectStoreHeap {
 	rv := &collectStoreHeap{
-		heap:    make(search.DocumentMatchCollection, 0, cap),
+		heap:    make(search.DocumentMatchCollection, 0, capacity),
 		compare: compare,
 	}
 	heap.Init(rv)
 	return rv
 }
 
-func (c *collectStoreHeap) Add(doc *search.DocumentMatch) {
+func (c *collectStoreHeap) AddNotExceedingSize(doc *search.DocumentMatch,
+	size int) *search.DocumentMatch {
+	c.add(doc)
+	if c.Len() > size {
+		return c.removeLast()
+	}
+	return nil
+}
+
+func (c *collectStoreHeap) add(doc *search.DocumentMatch) {
 	heap.Push(c, doc)
 }
 
-func (c *collectStoreHeap) RemoveLast() *search.DocumentMatch {
+func (c *collectStoreHeap) removeLast() *search.DocumentMatch {
 	return heap.Pop(c).(*search.DocumentMatch)
 }
 
@@ -49,17 +58,12 @@ func (c *collectStoreHeap) Final(skip int, fixup collectorFixup) (search.Documen
 		return make(search.DocumentMatchCollection, 0), nil
 	}
 	rv := make(search.DocumentMatchCollection, size)
-	for count > 0 {
-		count--
-
-		if count >= skip {
-			size--
-			doc := heap.Pop(c).(*search.DocumentMatch)
-			rv[size] = doc
-			err := fixup(doc)
-			if err != nil {
-				return nil, err
-			}
+	for i := size - 1; i >= 0; i-- {
+		doc := heap.Pop(c).(*search.DocumentMatch)
+		rv[i] = doc
+		err := fixup(doc)
+		if err != nil {
+			return nil, err
 		}
 	}
 	return rv, nil

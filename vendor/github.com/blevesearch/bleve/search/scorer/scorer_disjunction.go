@@ -16,47 +16,56 @@ package scorer
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/size"
 )
 
-type DisjunctionQueryScorer struct {
-	explain bool
+var reflectStaticSizeDisjunctionQueryScorer int
+
+func init() {
+	var dqs DisjunctionQueryScorer
+	reflectStaticSizeDisjunctionQueryScorer = int(reflect.TypeOf(dqs).Size())
 }
 
-func NewDisjunctionQueryScorer(explain bool) *DisjunctionQueryScorer {
+type DisjunctionQueryScorer struct {
+	options search.SearcherOptions
+}
+
+func (s *DisjunctionQueryScorer) Size() int {
+	return reflectStaticSizeDisjunctionQueryScorer + size.SizeOfPtr
+}
+
+func NewDisjunctionQueryScorer(options search.SearcherOptions) *DisjunctionQueryScorer {
 	return &DisjunctionQueryScorer{
-		explain: explain,
+		options: options,
 	}
 }
 
 func (s *DisjunctionQueryScorer) Score(ctx *search.SearchContext, constituents []*search.DocumentMatch, countMatch, countTotal int) *search.DocumentMatch {
 	var sum float64
 	var childrenExplanations []*search.Explanation
-	if s.explain {
+	if s.options.Explain {
 		childrenExplanations = make([]*search.Explanation, len(constituents))
 	}
 
-	var locations []search.FieldTermLocationMap
 	for i, docMatch := range constituents {
 		sum += docMatch.Score
-		if s.explain {
+		if s.options.Explain {
 			childrenExplanations[i] = docMatch.Expl
-		}
-		if docMatch.Locations != nil {
-			locations = append(locations, docMatch.Locations)
 		}
 	}
 
 	var rawExpl *search.Explanation
-	if s.explain {
+	if s.options.Explain {
 		rawExpl = &search.Explanation{Value: sum, Message: "sum of:", Children: childrenExplanations}
 	}
 
 	coord := float64(countMatch) / float64(countTotal)
 	newScore := sum * coord
 	var newExpl *search.Explanation
-	if s.explain {
+	if s.options.Explain {
 		ce := make([]*search.Explanation, 2)
 		ce[0] = rawExpl
 		ce[1] = &search.Explanation{Value: coord, Message: fmt.Sprintf("coord(%d/%d)", countMatch, countTotal)}
@@ -67,11 +76,8 @@ func (s *DisjunctionQueryScorer) Score(ctx *search.SearchContext, constituents [
 	rv := constituents[0]
 	rv.Score = newScore
 	rv.Expl = newExpl
-	if len(locations) == 1 {
-		rv.Locations = locations[0]
-	} else if len(locations) > 1 {
-		rv.Locations = search.MergeLocations(locations)
-	}
+	rv.FieldTermLocations = search.MergeFieldTermLocations(
+		rv.FieldTermLocations, constituents[1:])
 
 	return rv
 }

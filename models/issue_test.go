@@ -80,7 +80,8 @@ func TestGetParticipantsByIssueID(t *testing.T) {
 	// User 1 is issue1 poster (see fixtures/issue.yml)
 	// User 2 only labeled issue1 (see fixtures/comment.yml)
 	// Users 3 and 5 made actual comments (see fixtures/comment.yml)
-	checkParticipants(1, []int{3, 5})
+	// User 3 is inactive, thus not active participant
+	checkParticipants(1, []int{5})
 }
 
 func TestIssue_AddLabel(t *testing.T) {
@@ -165,5 +166,132 @@ func TestUpdateIssueCols(t *testing.T) {
 	updatedIssue := AssertExistsAndLoadBean(t, &Issue{ID: issue.ID}).(*Issue)
 	assert.EqualValues(t, newTitle, updatedIssue.Title)
 	assert.EqualValues(t, prevContent, updatedIssue.Content)
-	AssertInt64InRange(t, now, then, updatedIssue.UpdatedUnix)
+	AssertInt64InRange(t, now, then, int64(updatedIssue.UpdatedUnix))
+}
+
+func TestIssues(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	for _, test := range []struct {
+		Opts             IssuesOptions
+		ExpectedIssueIDs []int64
+	}{
+		{
+			IssuesOptions{
+				AssigneeID: 1,
+				SortType:   "oldest",
+			},
+			[]int64{1, 6},
+		},
+		{
+			IssuesOptions{
+				RepoIDs:  []int64{1, 3},
+				SortType: "oldest",
+				Page:     1,
+				PageSize: 4,
+			},
+			[]int64{1, 2, 3, 5},
+		},
+		{
+			IssuesOptions{
+				LabelIDs: []int64{1},
+				Page:     1,
+				PageSize: 4,
+			},
+			[]int64{2, 1},
+		},
+		{
+			IssuesOptions{
+				LabelIDs: []int64{1, 2},
+				Page:     1,
+				PageSize: 4,
+			},
+			[]int64{}, // issues with **both** label 1 and 2, none of these issues matches, TODO: add more tests
+		},
+	} {
+		issues, err := Issues(&test.Opts)
+		assert.NoError(t, err)
+		if assert.Len(t, issues, len(test.ExpectedIssueIDs)) {
+			for i, issue := range issues {
+				assert.EqualValues(t, test.ExpectedIssueIDs[i], issue.ID)
+			}
+		}
+	}
+}
+
+func TestGetUserIssueStats(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	for _, test := range []struct {
+		Opts               UserIssueStatsOptions
+		ExpectedIssueStats IssueStats
+	}{
+		{
+			UserIssueStatsOptions{
+				UserID:     1,
+				RepoID:     1,
+				FilterMode: FilterModeAll,
+			},
+			IssueStats{
+				YourRepositoriesCount: 0,
+				AssignCount:           1,
+				CreateCount:           1,
+				OpenCount:             0,
+				ClosedCount:           0,
+			},
+		},
+		{
+			UserIssueStatsOptions{
+				UserID:     1,
+				FilterMode: FilterModeAssign,
+			},
+			IssueStats{
+				YourRepositoriesCount: 0,
+				AssignCount:           2,
+				CreateCount:           2,
+				OpenCount:             2,
+				ClosedCount:           0,
+			},
+		},
+		{
+			UserIssueStatsOptions{
+				UserID:     1,
+				FilterMode: FilterModeCreate,
+			},
+			IssueStats{
+				YourRepositoriesCount: 0,
+				AssignCount:           2,
+				CreateCount:           2,
+				OpenCount:             2,
+				ClosedCount:           0,
+			},
+		},
+		{
+			UserIssueStatsOptions{
+				UserID:      2,
+				UserRepoIDs: []int64{1, 2},
+				FilterMode:  FilterModeAll,
+				IsClosed:    true,
+			},
+			IssueStats{
+				YourRepositoriesCount: 2,
+				AssignCount:           0,
+				CreateCount:           2,
+				OpenCount:             2,
+				ClosedCount:           2,
+			},
+		},
+	} {
+		stats, err := GetUserIssueStats(test.Opts)
+		if !assert.NoError(t, err) {
+			continue
+		}
+		assert.Equal(t, test.ExpectedIssueStats, *stats)
+	}
+}
+
+func TestIssue_loadTotalTimes(t *testing.T) {
+	assert.NoError(t, PrepareTestDatabase())
+	ms, err := GetIssueByID(2)
+	assert.NoError(t, err)
+	assert.NoError(t, ms.loadTotalTimes(x))
+	assert.Equal(t, int64(3662), ms.TotalTrackedTime)
 }

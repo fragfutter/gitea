@@ -15,40 +15,61 @@
 package searcher
 
 import (
+	"reflect"
+
 	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/search"
 	"github.com/blevesearch/bleve/search/scorer"
+	"github.com/blevesearch/bleve/size"
 )
+
+var reflectStaticSizeTermSearcher int
+
+func init() {
+	var ts TermSearcher
+	reflectStaticSizeTermSearcher = int(reflect.TypeOf(ts).Size())
+}
 
 type TermSearcher struct {
 	indexReader index.IndexReader
-	term        string
-	field       string
 	reader      index.TermFieldReader
 	scorer      *scorer.TermQueryScorer
 	tfd         index.TermFieldDoc
-	explain     bool
 }
 
-func NewTermSearcher(indexReader index.IndexReader, term string, field string, boost float64, explain bool) (*TermSearcher, error) {
-	reader, err := indexReader.TermFieldReader([]byte(term), field, true, true, true)
+func NewTermSearcher(indexReader index.IndexReader, term string, field string, boost float64, options search.SearcherOptions) (*TermSearcher, error) {
+	return NewTermSearcherBytes(indexReader, []byte(term), field, boost, options)
+}
+
+func NewTermSearcherBytes(indexReader index.IndexReader, term []byte, field string, boost float64, options search.SearcherOptions) (*TermSearcher, error) {
+	needFreqNorm := options.Score != "none"
+	reader, err := indexReader.TermFieldReader(term, field, needFreqNorm, needFreqNorm, options.IncludeTermVectors)
 	if err != nil {
 		return nil, err
 	}
+	return newTermSearcherFromReader(indexReader, reader, term, field, boost, options)
+}
+
+func newTermSearcherFromReader(indexReader index.IndexReader, reader index.TermFieldReader,
+	term []byte, field string, boost float64, options search.SearcherOptions) (*TermSearcher, error) {
 	count, err := indexReader.DocCount()
 	if err != nil {
 		_ = reader.Close()
 		return nil, err
 	}
-	scorer := scorer.NewTermQueryScorer(term, field, boost, count, reader.Count(), explain)
+	scorer := scorer.NewTermQueryScorer(term, field, boost, count, reader.Count(), options)
 	return &TermSearcher{
 		indexReader: indexReader,
-		term:        term,
-		field:       field,
-		explain:     explain,
 		reader:      reader,
 		scorer:      scorer,
 	}, nil
+}
+
+func (s *TermSearcher) Size() int {
+	return reflectStaticSizeTermSearcher + size.SizeOfPtr +
+		s.reader.Size() +
+		s.tfd.Size() +
+		s.scorer.Size()
 }
 
 func (s *TermSearcher) Count() uint64 {
@@ -107,4 +128,14 @@ func (s *TermSearcher) Min() int {
 
 func (s *TermSearcher) DocumentMatchPoolSize() int {
 	return 1
+}
+
+func (s *TermSearcher) Optimize(kind string, octx index.OptimizableContext) (
+	index.OptimizableContext, error) {
+	o, ok := s.reader.(index.Optimizable)
+	if ok {
+		return o.Optimize(kind, octx)
+	}
+
+	return octx, nil
 }

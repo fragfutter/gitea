@@ -15,12 +15,30 @@
 package collector
 
 import (
+	"context"
+	"reflect"
 	"time"
 
 	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/search"
-	"golang.org/x/net/context"
+	"github.com/blevesearch/bleve/size"
 )
+
+var reflectStaticSizeTopNCollector int
+
+func init() {
+	var coll TopNCollector
+	reflectStaticSizeTopNCollector = int(reflect.TypeOf(coll).Size())
+}
+
+type collectorStore interface {
+	// Add the document, and if the new store size exceeds the provided size
+	// the last element is removed and returned.  If the size has not been
+	// exceeded, nil is returned.
+	AddNotExceedingSize(doc *search.DocumentMatch, size int) *search.DocumentMatch
+
+	Final(skip int, fixup collectorFixup) (search.DocumentMatchCollection, error)
+}
 
 // PreAllocSizeSkipCap will cap preallocation to this amount when
 // size+skip exceeds this value
@@ -41,7 +59,7 @@ type TopNCollector struct {
 	results       search.DocumentMatchCollection
 	facetsBuilder *search.FacetsBuilder
 
-	store *collectStoreSlice
+	store collectorStore
 
 	needDocIds    bool
 	neededFields  []string
@@ -49,6 +67,8 @@ type TopNCollector struct {
 	cachedDesc    []bool
 
 	lowestMatchOutsideResults *search.DocumentMatch
+	updateFieldVisitor        index.DocumentFieldTermVisitor
+	dvReader                  index.DocValueReader
 }
 
 // CheckDoneEvery controls how frequently we check the context deadline
@@ -68,9 +88,15 @@ func NewTopNCollector(size int, skip int, sort search.SortOrder) *TopNCollector 
 		backingSize = PreAllocSizeSkipCap + 1
 	}
 
-	hc.store = newStoreSlice(backingSize, func(i, j *search.DocumentMatch) int {
-		return hc.sort.Compare(hc.cachedScoring, hc.cachedDesc, i, j)
-	})
+	if size+skip > 10 {
+		hc.store = newStoreHeap(backingSize, func(i, j *search.DocumentMatch) int {
+			return hc.sort.Compare(hc.cachedScoring, hc.cachedDesc, i, j)
+		})
+	} else {
+		hc.store = newStoreSlice(backingSize, func(i, j *search.DocumentMatch) int {
+			return hc.sort.Compare(hc.cachedScoring, hc.cachedDesc, i, j)
+		})
+	}
 
 	// these lookups traverse an interface, so do once up-front
 	if sort.RequiresDocID() {
@@ -81,6 +107,22 @@ func NewTopNCollector(size int, skip int, sort search.SortOrder) *TopNCollector 
 	hc.cachedDesc = sort.CacheDescending()
 
 	return hc
+}
+
+func (hc *TopNCollector) Size() int {
+	sizeInBytes := reflectStaticSizeTopNCollector + size.SizeOfPtr
+
+	if hc.facetsBuilder != nil {
+		sizeInBytes += hc.facetsBuilder.Size()
+	}
+
+	for _, entry := range hc.neededFields {
+		sizeInBytes += len(entry) + size.SizeOfString
+	}
+
+	sizeInBytes += len(hc.cachedScoring) + len(hc.cachedDesc)
+
+	return sizeInBytes
 }
 
 // Collect goes to the index to find the matching documents
@@ -98,7 +140,33 @@ func (hc *TopNCollector) Collect(ctx context.Context, searcher search.Searcher, 
 	}
 	searchContext := &search.SearchContext{
 		DocumentMatchPool: search.NewDocumentMatchPool(backingSize+searcher.DocumentMatchPoolSize(), len(hc.sort)),
+		Collector:         hc,
 	}
+
+	hc.dvReader, err = reader.DocValueReader(hc.neededFields)
+	if err != nil {
+		return err
+	}
+
+	hc.updateFieldVisitor = func(field string, term []byte) {
+		if hc.facetsBuilder != nil {
+			hc.facetsBuilder.UpdateVisitor(field, term)
+		}
+		hc.sort.UpdateVisitor(field, term)
+	}
+
+	dmHandlerMaker := MakeTopNDocumentMatchHandler
+	if cv := ctx.Value(search.MakeDocumentMatchHandlerKey); cv != nil {
+		dmHandlerMaker = cv.(search.MakeDocumentMatchHandler)
+	}
+	// use the application given builder for making the custom document match
+	// handler and perform callbacks/invocations on the newly made handler.
+	dmHandler, loadID, err := dmHandlerMaker(searchContext)
+	if err != nil {
+		return err
+	}
+
+	hc.needDocIds = hc.needDocIds || loadID
 
 	select {
 	case <-ctx.Done():
@@ -114,20 +182,27 @@ func (hc *TopNCollector) Collect(ctx context.Context, searcher search.Searcher, 
 			default:
 			}
 		}
-		if hc.facetsBuilder != nil {
-			err = hc.facetsBuilder.Update(next)
-			if err != nil {
-				break
-			}
+
+		err = hc.prepareDocumentMatch(searchContext, reader, next)
+		if err != nil {
+			break
 		}
 
-		err = hc.collectSingle(searchContext, reader, next)
+		err = dmHandler(next)
 		if err != nil {
 			break
 		}
 
 		next, err = searcher.Next(searchContext)
 	}
+
+	// help finalize/flush the results in case
+	// of custom document match handlers.
+	err = dmHandler(nil)
+	if err != nil {
+		return err
+	}
+
 	// compute search duration
 	hc.took = time.Since(startTime)
 	if err != nil {
@@ -143,7 +218,17 @@ func (hc *TopNCollector) Collect(ctx context.Context, searcher search.Searcher, 
 
 var sortByScoreOpt = []string{"_score"}
 
-func (hc *TopNCollector) collectSingle(ctx *search.SearchContext, reader index.IndexReader, d *search.DocumentMatch) error {
+func (hc *TopNCollector) prepareDocumentMatch(ctx *search.SearchContext,
+	reader index.IndexReader, d *search.DocumentMatch) (err error) {
+
+	// visit field terms for features that require it (sort, facets)
+	if len(hc.neededFields) > 0 {
+		err = hc.visitFieldTerms(reader, d)
+		if err != nil {
+			return err
+		}
+	}
+
 	// increment total hits
 	hc.total++
 	d.HitNumber = hc.total
@@ -153,29 +238,12 @@ func (hc *TopNCollector) collectSingle(ctx *search.SearchContext, reader index.I
 		hc.maxScore = d.Score
 	}
 
-	var err error
 	// see if we need to load ID (at this early stage, for example to sort on it)
 	if hc.needDocIds {
 		d.ID, err = reader.ExternalID(d.IndexInternalID)
 		if err != nil {
 			return err
 		}
-	}
-
-	// see if we need to load the stored fields
-	if len(hc.neededFields) > 0 {
-		// find out which fields haven't been loaded yet
-		fieldsToLoad := d.CachedFieldTerms.FieldsNotYetCached(hc.neededFields)
-		// look them up
-		fieldTerms, err := reader.DocumentFieldTerms(d.IndexInternalID, fieldsToLoad)
-		if err != nil {
-			return err
-		}
-		// cache these as well
-		if d.CachedFieldTerms == nil {
-			d.CachedFieldTerms = make(map[string][]string)
-		}
-		d.CachedFieldTerms.Merge(fieldTerms)
 	}
 
 	// compute this hits sort value
@@ -185,39 +253,70 @@ func (hc *TopNCollector) collectSingle(ctx *search.SearchContext, reader index.I
 		hc.sort.Value(d)
 	}
 
-	// optimization, we track lowest sorting hit already removed from heap
-	// with this one comparison, we can avoid all heap operations if
-	// this hit would have been added and then immediately removed
-	if hc.lowestMatchOutsideResults != nil {
-		cmp := hc.sort.Compare(hc.cachedScoring, hc.cachedDesc, d, hc.lowestMatchOutsideResults)
-		if cmp >= 0 {
-			// this hit can't possibly be in the result set, so avoid heap ops
-			ctx.DocumentMatchPool.Put(d)
-			return nil
-		}
-	}
-
-	hc.store.Add(d)
-	if hc.store.Len() > hc.size+hc.skip {
-		removed := hc.store.RemoveLast()
-		if hc.lowestMatchOutsideResults == nil {
-			hc.lowestMatchOutsideResults = removed
-		} else {
-			cmp := hc.sort.Compare(hc.cachedScoring, hc.cachedDesc, removed, hc.lowestMatchOutsideResults)
-			if cmp < 0 {
-				tmp := hc.lowestMatchOutsideResults
-				hc.lowestMatchOutsideResults = removed
-				ctx.DocumentMatchPool.Put(tmp)
-			}
-		}
-	}
-
 	return nil
+}
+
+func MakeTopNDocumentMatchHandler(
+	ctx *search.SearchContext) (search.DocumentMatchHandler, bool, error) {
+	var hc *TopNCollector
+	var ok bool
+	if hc, ok = ctx.Collector.(*TopNCollector); ok {
+		return func(d *search.DocumentMatch) error {
+			if d == nil {
+				return nil
+			}
+			// optimization, we track lowest sorting hit already removed from heap
+			// with this one comparison, we can avoid all heap operations if
+			// this hit would have been added and then immediately removed
+			if hc.lowestMatchOutsideResults != nil {
+				cmp := hc.sort.Compare(hc.cachedScoring, hc.cachedDesc, d,
+					hc.lowestMatchOutsideResults)
+				if cmp >= 0 {
+					// this hit can't possibly be in the result set, so avoid heap ops
+					ctx.DocumentMatchPool.Put(d)
+					return nil
+				}
+			}
+
+			removed := hc.store.AddNotExceedingSize(d, hc.size+hc.skip)
+			if removed != nil {
+				if hc.lowestMatchOutsideResults == nil {
+					hc.lowestMatchOutsideResults = removed
+				} else {
+					cmp := hc.sort.Compare(hc.cachedScoring, hc.cachedDesc,
+						removed, hc.lowestMatchOutsideResults)
+					if cmp < 0 {
+						tmp := hc.lowestMatchOutsideResults
+						hc.lowestMatchOutsideResults = removed
+						ctx.DocumentMatchPool.Put(tmp)
+					}
+				}
+			}
+			return nil
+		}, false, nil
+	}
+	return nil, false, nil
+}
+
+// visitFieldTerms is responsible for visiting the field terms of the
+// search hit, and passing visited terms to the sort and facet builder
+func (hc *TopNCollector) visitFieldTerms(reader index.IndexReader, d *search.DocumentMatch) error {
+	if hc.facetsBuilder != nil {
+		hc.facetsBuilder.StartDoc()
+	}
+
+	err := hc.dvReader.VisitDocValues(d.IndexInternalID, hc.updateFieldVisitor)
+	if hc.facetsBuilder != nil {
+		hc.facetsBuilder.EndDoc()
+	}
+
+	return err
 }
 
 // SetFacetsBuilder registers a facet builder for this collector
 func (hc *TopNCollector) SetFacetsBuilder(facetsBuilder *search.FacetsBuilder) {
 	hc.facetsBuilder = facetsBuilder
+	hc.neededFields = append(hc.neededFields, hc.facetsBuilder.RequiredFields()...)
 }
 
 // finalizeResults starts with the heap containing the final top size+skip
@@ -234,6 +333,7 @@ func (hc *TopNCollector) finalizeResults(r index.IndexReader) error {
 				return err
 			}
 		}
+		doc.Complete(nil)
 		return nil
 	})
 
@@ -265,5 +365,5 @@ func (hc *TopNCollector) FacetResults() search.FacetResults {
 	if hc.facetsBuilder != nil {
 		return hc.facetsBuilder.Results()
 	}
-	return search.FacetResults{}
+	return nil
 }

@@ -1,20 +1,28 @@
 package models
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
-	"github.com/go-xorm/xorm"
-	"time"
+	"fmt"
+	"io"
+
+	"code.gitea.io/gitea/modules/util"
 )
 
 // LFSMetaObject stores metadata for LFS tracked files.
 type LFSMetaObject struct {
-	ID           int64     `xorm:"pk autoincr"`
-	Oid          string    `xorm:"UNIQUE(s) INDEX NOT NULL"`
-	Size         int64     `xorm:"NOT NULL"`
-	RepositoryID int64     `xorm:"UNIQUE(s) INDEX NOT NULL"`
-	Existing     bool      `xorm:"-"`
-	Created      time.Time `xorm:"-"`
-	CreatedUnix  int64
+	ID           int64          `xorm:"pk autoincr"`
+	Oid          string         `xorm:"UNIQUE(s) INDEX NOT NULL"`
+	Size         int64          `xorm:"NOT NULL"`
+	RepositoryID int64          `xorm:"UNIQUE(s) INDEX NOT NULL"`
+	Existing     bool           `xorm:"-"`
+	CreatedUnix  util.TimeStamp `xorm:"created"`
+}
+
+// Pointer returns the string representation of an LFS pointer file
+func (m *LFSMetaObject) Pointer() string {
+	return fmt.Sprintf("%s\n%s%s\nsize %d\n", LFSMetaFileIdentifier, LFSMetaFileOidPrefix, m.Oid, m.Size)
 }
 
 // LFSTokenResponse defines the JSON structure in which the JWT token is stored.
@@ -45,20 +53,20 @@ const (
 func NewLFSMetaObject(m *LFSMetaObject) (*LFSMetaObject, error) {
 	var err error
 
-	has, err := x.Get(m)
+	sess := x.NewSession()
+	defer sess.Close()
+	if err = sess.Begin(); err != nil {
+		return nil, err
+	}
+
+	has, err := sess.Get(m)
 	if err != nil {
 		return nil, err
 	}
 
 	if has {
 		m.Existing = true
-		return m, nil
-	}
-
-	sess := x.NewSession()
-	defer sess.Close()
-	if err = sess.Begin(); err != nil {
-		return nil, err
+		return m, sess.Commit()
 	}
 
 	if _, err = sess.Insert(m); err != nil {
@@ -68,15 +76,25 @@ func NewLFSMetaObject(m *LFSMetaObject) (*LFSMetaObject, error) {
 	return m, sess.Commit()
 }
 
+// GenerateLFSOid generates a Sha256Sum to represent an oid for arbitrary content
+func GenerateLFSOid(content io.Reader) (string, error) {
+	h := sha256.New()
+	if _, err := io.Copy(h, content); err != nil {
+		return "", err
+	}
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum), nil
+}
+
 // GetLFSMetaObjectByOid selects a LFSMetaObject entry from database by its OID.
 // It may return ErrLFSObjectNotExist or a database error. If the error is nil,
 // the returned pointer is a valid LFSMetaObject.
-func GetLFSMetaObjectByOid(oid string) (*LFSMetaObject, error) {
+func (repo *Repository) GetLFSMetaObjectByOid(oid string) (*LFSMetaObject, error) {
 	if len(oid) == 0 {
 		return nil, ErrLFSObjectNotExist
 	}
 
-	m := &LFSMetaObject{Oid: oid}
+	m := &LFSMetaObject{Oid: oid, RepositoryID: repo.ID}
 	has, err := x.Get(m)
 	if err != nil {
 		return nil, err
@@ -88,7 +106,7 @@ func GetLFSMetaObjectByOid(oid string) (*LFSMetaObject, error) {
 
 // RemoveLFSMetaObjectByOid removes a LFSMetaObject entry from database by its OID.
 // It may return ErrLFSObjectNotExist or a database error.
-func RemoveLFSMetaObjectByOid(oid string) error {
+func (repo *Repository) RemoveLFSMetaObjectByOid(oid string) error {
 	if len(oid) == 0 {
 		return ErrLFSObjectNotExist
 	}
@@ -99,24 +117,10 @@ func RemoveLFSMetaObjectByOid(oid string) error {
 		return err
 	}
 
-	m := &LFSMetaObject{Oid: oid}
-
+	m := &LFSMetaObject{Oid: oid, RepositoryID: repo.ID}
 	if _, err := sess.Delete(m); err != nil {
 		return err
 	}
 
 	return sess.Commit()
-}
-
-// BeforeInsert sets the time at which the LFSMetaObject was created.
-func (m *LFSMetaObject) BeforeInsert() {
-	m.CreatedUnix = time.Now().Unix()
-}
-
-// AfterSet stores the LFSMetaObject creation time in the database as local time.
-func (m *LFSMetaObject) AfterSet(colName string, _ xorm.Cell) {
-	switch colName {
-	case "created_unix":
-		m.Created = time.Unix(m.CreatedUnix, 0).Local()
-	}
 }

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/go-macaron/csrf"
+
 	"code.gitea.io/git"
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/base"
@@ -51,6 +53,10 @@ type APIForbiddenError struct {
 // swagger:response notFound
 type APINotFound struct{}
 
+//APIRedirect is a redirect response
+// swagger:response redirect
+type APIRedirect struct{}
+
 // Error responses error message to client with given message.
 // If status is 500, also it prints error to log.
 func (ctx *APIContext) Error(status int, title string, obj interface{}) {
@@ -93,6 +99,17 @@ func (ctx *APIContext) SetLinkHeader(total, pageSize int) {
 	}
 }
 
+// RequireCSRF requires a validated a CSRF token
+func (ctx *APIContext) RequireCSRF() {
+	headerToken := ctx.Req.Header.Get(ctx.csrf.GetHeaderName())
+	formValueToken := ctx.Req.FormValue(ctx.csrf.GetFormName())
+	if len(headerToken) > 0 || len(formValueToken) > 0 {
+		csrf.Validate(ctx.Context.Context, ctx.csrf)
+	} else {
+		ctx.Context.Error(401)
+	}
+}
+
 // APIContexter returns apicontext as macaron middleware
 func APIContexter() macaron.Handler {
 	return func(c *Context) {
@@ -107,7 +124,7 @@ func APIContexter() macaron.Handler {
 func ReferencesGitRepo() macaron.Handler {
 	return func(ctx *APIContext) {
 		// Empty repository does not have reference information.
-		if ctx.Repo.Repository.IsBare {
+		if ctx.Repo.Repository.IsEmpty {
 			return
 		}
 

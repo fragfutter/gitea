@@ -15,12 +15,23 @@
 package facet
 
 import (
+	"reflect"
 	"sort"
 
-	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/numeric"
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/size"
 )
+
+var reflectStaticSizeNumericFacetBuilder int
+var reflectStaticSizenumericRange int
+
+func init() {
+	var nfb NumericFacetBuilder
+	reflectStaticSizeNumericFacetBuilder = int(reflect.TypeOf(nfb).Size())
+	var nr numericRange
+	reflectStaticSizenumericRange = int(reflect.TypeOf(nr).Size())
+}
 
 type numericRange struct {
 	min *float64
@@ -34,6 +45,7 @@ type NumericFacetBuilder struct {
 	total      int
 	missing    int
 	ranges     map[string]*numericRange
+	sawValue   bool
 }
 
 func NewNumericFacetBuilder(field string, size int) *NumericFacetBuilder {
@@ -43,6 +55,23 @@ func NewNumericFacetBuilder(field string, size int) *NumericFacetBuilder {
 		termsCount: make(map[string]int),
 		ranges:     make(map[string]*numericRange, 0),
 	}
+}
+
+func (fb *NumericFacetBuilder) Size() int {
+	sizeInBytes := reflectStaticSizeNumericFacetBuilder + size.SizeOfPtr +
+		len(fb.field)
+
+	for k, _ := range fb.termsCount {
+		sizeInBytes += size.SizeOfString + len(k) +
+			size.SizeOfInt
+	}
+
+	for k, _ := range fb.ranges {
+		sizeInBytes += size.SizeOfString + len(k) +
+			size.SizeOfPtr + reflectStaticSizenumericRange
+	}
+
+	return sizeInBytes
 }
 
 func (fb *NumericFacetBuilder) AddRange(name string, min, max *float64) {
@@ -57,36 +86,35 @@ func (fb *NumericFacetBuilder) Field() string {
 	return fb.field
 }
 
-func (fb *NumericFacetBuilder) Update(ft index.FieldTerms) {
-	terms, ok := ft[fb.field]
-	if ok {
-		for _, term := range terms {
-			// only consider the values which are shifted 0
-			prefixCoded := numeric.PrefixCoded(term)
-			shift, err := prefixCoded.Shift()
-			if err == nil && shift == 0 {
-				i64, err := prefixCoded.Int64()
-				if err == nil {
-					f64 := numeric.Int64ToFloat64(i64)
+func (fb *NumericFacetBuilder) UpdateVisitor(field string, term []byte) {
+	if field == fb.field {
+		fb.sawValue = true
+		// only consider the values which are shifted 0
+		prefixCoded := numeric.PrefixCoded(term)
+		shift, err := prefixCoded.Shift()
+		if err == nil && shift == 0 {
+			i64, err := prefixCoded.Int64()
+			if err == nil {
+				f64 := numeric.Int64ToFloat64(i64)
 
-					// look at each of the ranges for a match
-					for rangeName, r := range fb.ranges {
-
-						if (r.min == nil || f64 >= *r.min) && (r.max == nil || f64 < *r.max) {
-
-							existingCount, existed := fb.termsCount[rangeName]
-							if existed {
-								fb.termsCount[rangeName] = existingCount + 1
-							} else {
-								fb.termsCount[rangeName] = 1
-							}
-							fb.total++
-						}
+				// look at each of the ranges for a match
+				for rangeName, r := range fb.ranges {
+					if (r.min == nil || f64 >= *r.min) && (r.max == nil || f64 < *r.max) {
+						fb.termsCount[rangeName] = fb.termsCount[rangeName] + 1
+						fb.total++
 					}
 				}
 			}
 		}
-	} else {
+	}
+}
+
+func (fb *NumericFacetBuilder) StartDoc() {
+	fb.sawValue = false
+}
+
+func (fb *NumericFacetBuilder) EndDoc() {
+	if !fb.sawValue {
 		fb.missing++
 	}
 }

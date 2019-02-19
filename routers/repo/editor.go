@@ -19,6 +19,7 @@ import (
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/templates"
+	"code.gitea.io/gitea/modules/uploader"
 )
 
 const (
@@ -32,7 +33,7 @@ const (
 )
 
 func renderCommitRights(ctx *context.Context) bool {
-	canCommit, err := ctx.Repo.CanCommitToBranch()
+	canCommit, err := ctx.Repo.CanCommitToBranch(ctx.User)
 	if err != nil {
 		log.Error(4, "CanCommitToBranch: %v", err)
 	}
@@ -62,6 +63,16 @@ func editFile(ctx *context.Context, isNewFile bool) {
 	ctx.Data["RequireSimpleMDE"] = true
 	canCommit := renderCommitRights(ctx)
 
+	treePath := cleanUploadFileName(ctx.Repo.TreePath)
+	if treePath != ctx.Repo.TreePath {
+		if isNewFile {
+			ctx.Redirect(path.Join(ctx.Repo.RepoLink, "_new", ctx.Repo.BranchName, treePath))
+		} else {
+			ctx.Redirect(path.Join(ctx.Repo.RepoLink, "_edit", ctx.Repo.BranchName, treePath))
+		}
+		return
+	}
+
 	treeNames, treePaths := getParentTreeFields(ctx.Repo.TreePath)
 
 	if !isNewFile {
@@ -73,14 +84,19 @@ func editFile(ctx *context.Context, isNewFile bool) {
 
 		// No way to edit a directory online.
 		if entry.IsDir() {
-			ctx.Handle(404, "", nil)
+			ctx.NotFound("entry.IsDir", nil)
 			return
 		}
 
 		blob := entry.Blob()
+		if blob.Size() >= setting.UI.MaxDisplayFileSize {
+			ctx.NotFound("blob.Size", err)
+			return
+		}
+
 		dataRc, err := blob.Data()
 		if err != nil {
-			ctx.Handle(404, "blob.Data", err)
+			ctx.NotFound("blob.Data", err)
 			return
 		}
 
@@ -93,7 +109,7 @@ func editFile(ctx *context.Context, isNewFile bool) {
 
 		// Only text file are editable online.
 		if !base.IsTextFile(buf) {
-			ctx.Handle(404, "", nil)
+			ctx.NotFound("base.IsTextFile", nil)
 			return
 		}
 
@@ -113,7 +129,7 @@ func editFile(ctx *context.Context, isNewFile bool) {
 
 	ctx.Data["TreeNames"] = treeNames
 	ctx.Data["TreePaths"] = treePaths
-	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchName
+	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchNameSubURL()
 	ctx.Data["commit_summary"] = ""
 	ctx.Data["commit_message"] = ""
 	if canCommit {
@@ -150,7 +166,7 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 
 	oldBranchName := ctx.Repo.BranchName
 	branchName := oldBranchName
-	oldTreePath := ctx.Repo.TreePath
+	oldTreePath := cleanUploadFileName(ctx.Repo.TreePath)
 	lastCommit := form.LastCommit
 	form.LastCommit = ctx.Repo.Commit.ID.String()
 
@@ -158,13 +174,17 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 		branchName = form.NewBranchName
 	}
 
-	form.TreePath = strings.Trim(form.TreePath, " /")
+	form.TreePath = cleanUploadFileName(form.TreePath)
+	if len(form.TreePath) == 0 {
+		ctx.Error(500, "Upload file name is invalid")
+		return
+	}
 	treeNames, treePaths := getParentTreeFields(form.TreePath)
 
 	ctx.Data["TreePath"] = form.TreePath
 	ctx.Data["TreeNames"] = treeNames
 	ctx.Data["TreePaths"] = treePaths
-	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + branchName
+	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/branch/" + branchName
 	ctx.Data["FileContent"] = form.Content
 	ctx.Data["commit_summary"] = form.CommitSummary
 	ctx.Data["commit_message"] = form.CommitMessage
@@ -209,7 +229,7 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 				break
 			}
 
-			ctx.Handle(500, "Repo.Commit.GetTreeEntryByPath", err)
+			ctx.ServerError("Repo.Commit.GetTreeEntryByPath", err)
 			return
 		}
 		if index != len(treeNames)-1 {
@@ -239,14 +259,14 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 				ctx.Data["Err_TreePath"] = true
 				ctx.RenderWithErr(ctx.Tr("repo.editor.file_editing_no_longer_exists", oldTreePath), tplEditFile, &form)
 			} else {
-				ctx.Handle(500, "GetTreeEntryByPath", err)
+				ctx.ServerError("GetTreeEntryByPath", err)
 			}
 			return
 		}
 		if lastCommit != ctx.Repo.CommitID {
 			files, err := ctx.Repo.Commit.GetFilesChangedSinceCommit(lastCommit)
 			if err != nil {
-				ctx.Handle(500, "GetFilesChangedSinceCommit", err)
+				ctx.ServerError("GetFilesChangedSinceCommit", err)
 				return
 			}
 
@@ -264,7 +284,7 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 		entry, err := ctx.Repo.Commit.GetTreeEntryByPath(form.TreePath)
 		if err != nil {
 			if !git.IsErrNotExist(err) {
-				ctx.Handle(500, "GetTreeEntryByPath", err)
+				ctx.ServerError("GetTreeEntryByPath", err)
 				return
 			}
 		}
@@ -289,7 +309,7 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 		message += "\n\n" + form.CommitMessage
 	}
 
-	if err := ctx.Repo.Repository.UpdateRepoFile(ctx.User, models.UpdateRepoFileOptions{
+	if err := uploader.UpdateRepoFile(ctx.Repo.Repository, ctx.User, &uploader.UpdateRepoFileOptions{
 		LastCommitID: lastCommit,
 		OldBranch:    oldBranchName,
 		NewBranch:    branchName,
@@ -304,7 +324,7 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 		return
 	}
 
-	ctx.Redirect(ctx.Repo.RepoLink + "/src/" + branchName + "/" + strings.NewReplacer("%", "%25", "#", "%23", " ", "%20", "?", "%3F").Replace(form.TreePath))
+	ctx.Redirect(ctx.Repo.RepoLink + "/src/branch/" + branchName + "/" + strings.NewReplacer("%", "%25", "#", "%23", " ", "%20", "?", "%3F").Replace(form.TreePath))
 }
 
 // EditFilePost response for editing file
@@ -319,7 +339,11 @@ func NewFilePost(ctx *context.Context, form auth.EditRepoFileForm) {
 
 // DiffPreviewPost render preview diff page
 func DiffPreviewPost(ctx *context.Context, form auth.EditPreviewDiffForm) {
-	treePath := ctx.Repo.TreePath
+	treePath := cleanUploadFileName(ctx.Repo.TreePath)
+	if len(treePath) == 0 {
+		ctx.Error(500, "file name to diff is invalid")
+		return
+	}
 
 	entry, err := ctx.Repo.Commit.GetTreeEntryByPath(treePath)
 	if err != nil {
@@ -330,7 +354,7 @@ func DiffPreviewPost(ctx *context.Context, form auth.EditPreviewDiffForm) {
 		return
 	}
 
-	diff, err := ctx.Repo.Repository.GetDiffPreview(ctx.Repo.BranchName, treePath, form.Content)
+	diff, err := uploader.GetDiffPreview(ctx.Repo.Repository, ctx.Repo.BranchName, treePath, form.Content)
 	if err != nil {
 		ctx.Error(500, "GetDiffPreview: "+err.Error())
 		return
@@ -348,8 +372,15 @@ func DiffPreviewPost(ctx *context.Context, form auth.EditPreviewDiffForm) {
 // DeleteFile render delete file page
 func DeleteFile(ctx *context.Context) {
 	ctx.Data["PageIsDelete"] = true
-	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchName
-	ctx.Data["TreePath"] = ctx.Repo.TreePath
+	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchNameSubURL()
+	treePath := cleanUploadFileName(ctx.Repo.TreePath)
+
+	if treePath != ctx.Repo.TreePath {
+		ctx.Redirect(path.Join(ctx.Repo.RepoLink, "_delete", ctx.Repo.BranchName, treePath))
+		return
+	}
+
+	ctx.Data["TreePath"] = treePath
 	canCommit := renderCommitRights(ctx)
 
 	ctx.Data["commit_summary"] = ""
@@ -367,7 +398,14 @@ func DeleteFile(ctx *context.Context) {
 // DeleteFilePost response for deleting file
 func DeleteFilePost(ctx *context.Context, form auth.DeleteRepoFileForm) {
 	ctx.Data["PageIsDelete"] = true
-	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchName
+	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchNameSubURL()
+
+	ctx.Repo.TreePath = cleanUploadFileName(ctx.Repo.TreePath)
+	if len(ctx.Repo.TreePath) == 0 {
+		ctx.Error(500, "Delete file name is invalid")
+		return
+	}
+
 	ctx.Data["TreePath"] = ctx.Repo.TreePath
 	canCommit := renderCommitRights(ctx)
 
@@ -410,19 +448,19 @@ func DeleteFilePost(ctx *context.Context, form auth.DeleteRepoFileForm) {
 		message += "\n\n" + form.CommitMessage
 	}
 
-	if err := ctx.Repo.Repository.DeleteRepoFile(ctx.User, models.DeleteRepoFileOptions{
+	if err := uploader.DeleteRepoFile(ctx.Repo.Repository, ctx.User, &uploader.DeleteRepoFileOptions{
 		LastCommitID: ctx.Repo.CommitID,
 		OldBranch:    oldBranchName,
 		NewBranch:    branchName,
 		TreePath:     ctx.Repo.TreePath,
 		Message:      message,
 	}); err != nil {
-		ctx.Handle(500, "DeleteRepoFile", err)
+		ctx.ServerError("DeleteRepoFile", err)
 		return
 	}
 
 	ctx.Flash.Success(ctx.Tr("repo.editor.file_delete_success", ctx.Repo.TreePath))
-	ctx.Redirect(ctx.Repo.RepoLink + "/src/" + branchName)
+	ctx.Redirect(ctx.Repo.RepoLink + "/src/branch/" + branchName)
 }
 
 func renderUploadSettings(ctx *context.Context) {
@@ -437,6 +475,12 @@ func UploadFile(ctx *context.Context) {
 	ctx.Data["PageIsUpload"] = true
 	renderUploadSettings(ctx)
 	canCommit := renderCommitRights(ctx)
+	treePath := cleanUploadFileName(ctx.Repo.TreePath)
+	if treePath != ctx.Repo.TreePath {
+		ctx.Redirect(path.Join(ctx.Repo.RepoLink, "_upload", ctx.Repo.BranchName, treePath))
+		return
+	}
+	ctx.Repo.TreePath = treePath
 
 	treeNames, treePaths := getParentTreeFields(ctx.Repo.TreePath)
 	if len(treeNames) == 0 {
@@ -446,7 +490,7 @@ func UploadFile(ctx *context.Context) {
 
 	ctx.Data["TreeNames"] = treeNames
 	ctx.Data["TreePaths"] = treePaths
-	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchName
+	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + ctx.Repo.BranchNameSubURL()
 	ctx.Data["commit_summary"] = ""
 	ctx.Data["commit_message"] = ""
 	if canCommit {
@@ -472,7 +516,8 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 		branchName = form.NewBranchName
 	}
 
-	form.TreePath = strings.Trim(form.TreePath, " /")
+	form.TreePath = cleanUploadFileName(form.TreePath)
+
 	treeNames, treePaths := getParentTreeFields(form.TreePath)
 	if len(treeNames) == 0 {
 		// We must at least have one element for user to input.
@@ -482,7 +527,7 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 	ctx.Data["TreePath"] = form.TreePath
 	ctx.Data["TreeNames"] = treeNames
 	ctx.Data["TreePaths"] = treePaths
-	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/" + branchName
+	ctx.Data["BranchLink"] = ctx.Repo.RepoLink + "/src/branch/" + branchName
 	ctx.Data["commit_summary"] = form.CommitSummary
 	ctx.Data["commit_message"] = form.CommitMessage
 	ctx.Data["commit_choice"] = form.CommitChoice
@@ -516,7 +561,7 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 				break
 			}
 
-			ctx.Handle(500, "Repo.Commit.GetTreeEntryByPath", err)
+			ctx.ServerError("Repo.Commit.GetTreeEntryByPath", err)
 			return
 		}
 
@@ -538,7 +583,7 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 		message += "\n\n" + form.CommitMessage
 	}
 
-	if err := ctx.Repo.Repository.UploadRepoFiles(ctx.User, models.UploadRepoFileOptions{
+	if err := uploader.UploadRepoFiles(ctx.Repo.Repository, ctx.User, &uploader.UploadRepoFileOptions{
 		LastCommitID: ctx.Repo.CommitID,
 		OldBranch:    oldBranchName,
 		NewBranch:    branchName,
@@ -551,7 +596,19 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 		return
 	}
 
-	ctx.Redirect(ctx.Repo.RepoLink + "/src/" + branchName + "/" + form.TreePath)
+	ctx.Redirect(ctx.Repo.RepoLink + "/src/branch/" + branchName + "/" + form.TreePath)
+}
+
+func cleanUploadFileName(name string) string {
+	// Rebase the filename
+	name = strings.Trim(path.Clean("/"+name), " /")
+	// Git disallows any filenames to have a .git directory in them.
+	for _, part := range strings.Split(name, "/") {
+		if strings.ToLower(part) == ".git" {
+			return ""
+		}
+	}
+	return name
 }
 
 // UploadFileToServer upload file to server file dir not git
@@ -586,7 +643,13 @@ func UploadFileToServer(ctx *context.Context) {
 		}
 	}
 
-	upload, err := models.NewUpload(header.Filename, buf, file)
+	name := cleanUploadFileName(header.Filename)
+	if len(name) == 0 {
+		ctx.Error(500, "Upload file name is invalid")
+		return
+	}
+
+	upload, err := models.NewUpload(name, buf, file)
 	if err != nil {
 		ctx.Error(500, fmt.Sprintf("NewUpload: %v", err))
 		return

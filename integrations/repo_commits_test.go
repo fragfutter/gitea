@@ -20,7 +20,7 @@ func TestRepoCommits(t *testing.T) {
 	session := loginUser(t, "user2")
 
 	// Request repository commits page
-	req := NewRequest(t, "GET", "/user2/repo1/commits/master")
+	req := NewRequest(t, "GET", "/user2/repo1/commits/branch/master")
 	resp := session.MakeRequest(t, req, http.StatusOK)
 
 	doc := NewHTMLParser(t, resp.Body)
@@ -33,9 +33,10 @@ func doTestRepoCommitWithStatus(t *testing.T, state string, classes ...string) {
 	prepareTestEnv(t)
 
 	session := loginUser(t, "user2")
+	token := getTokenForLoggedInUser(t, session)
 
 	// Request repository commits page
-	req := NewRequest(t, "GET", "/user2/repo1/commits/master")
+	req := NewRequest(t, "GET", "/user2/repo1/commits/branch/master")
 	resp := session.MakeRequest(t, req, http.StatusOK)
 
 	doc := NewHTMLParser(t, resp.Body)
@@ -45,7 +46,7 @@ func doTestRepoCommitWithStatus(t *testing.T, state string, classes ...string) {
 	assert.NotEmpty(t, commitURL)
 
 	// Call API to add status for commit
-	req = NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/statuses/"+path.Base(commitURL),
+	req = NewRequestWithJSON(t, "POST", "/api/v1/repos/user2/repo1/statuses/"+path.Base(commitURL)+"?token="+token,
 		api.CreateStatusOption{
 			State:       api.StatusState(state),
 			TargetURL:   "http://test.ci/",
@@ -56,7 +57,7 @@ func doTestRepoCommitWithStatus(t *testing.T, state string, classes ...string) {
 
 	resp = session.MakeRequest(t, req, http.StatusCreated)
 
-	req = NewRequest(t, "GET", "/user2/repo1/commits/master")
+	req = NewRequest(t, "GET", "/user2/repo1/commits/branch/master")
 	resp = session.MakeRequest(t, req, http.StatusOK)
 
 	doc = NewHTMLParser(t, resp.Body)

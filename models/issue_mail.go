@@ -1,4 +1,5 @@
 // Copyright 2016 The Gogs Authors. All rights reserved.
+// Copyright 2018 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -10,7 +11,7 @@ import (
 	"github.com/Unknwon/com"
 
 	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/markdown"
+	"code.gitea.io/gitea/modules/markup"
 	"code.gitea.io/gitea/modules/setting"
 )
 
@@ -22,29 +23,40 @@ func (issue *Issue) mailSubject() string {
 // This function sends two list of emails:
 // 1. Repository watchers and users who are participated in comments.
 // 2. Users who are not in 1. but get mentioned in current issue/comment.
-func mailIssueCommentToParticipants(issue *Issue, doer *User, comment *Comment, mentions []string) error {
+func mailIssueCommentToParticipants(e Engine, issue *Issue, doer *User, content string, comment *Comment, mentions []string) error {
 	if !setting.Service.EnableNotifyMail {
 		return nil
 	}
 
-	watchers, err := GetWatchers(issue.RepoID)
+	watchers, err := getWatchers(e, issue.RepoID)
 	if err != nil {
-		return fmt.Errorf("GetWatchers [repo_id: %d]: %v", issue.RepoID, err)
+		return fmt.Errorf("getWatchers [repo_id: %d]: %v", issue.RepoID, err)
 	}
-	participants, err := GetParticipantsByIssueID(issue.ID)
+	participants, err := getParticipantsByIssueID(e, issue.ID)
 	if err != nil {
-		return fmt.Errorf("GetParticipantsByIssueID [issue_id: %d]: %v", issue.ID, err)
+		return fmt.Errorf("getParticipantsByIssueID [issue_id: %d]: %v", issue.ID, err)
 	}
 
-	// In case the issue poster is not watching the repository,
+	// In case the issue poster is not watching the repository and is active,
 	// even if we have duplicated in watchers, can be safely filtered out.
-	if issue.PosterID != doer.ID {
+	err = issue.loadPoster(e)
+	if err != nil {
+		return fmt.Errorf("GetUserByID [%d]: %v", issue.PosterID, err)
+	}
+	if issue.PosterID != doer.ID && issue.Poster.IsActive && !issue.Poster.ProhibitLogin {
 		participants = append(participants, issue.Poster)
 	}
 
-	// Assignee must receive any communications
-	if issue.Assignee != nil && issue.AssigneeID > 0 && issue.AssigneeID != doer.ID {
-		participants = append(participants, issue.Assignee)
+	// Assignees must receive any communications
+	assignees, err := getAssigneesByIssue(e, issue)
+	if err != nil {
+		return err
+	}
+
+	for _, assignee := range assignees {
+		if assignee.ID != doer.ID {
+			participants = append(participants, assignee)
+		}
 	}
 
 	tos := make([]string, 0, len(watchers)) // List of email addresses.
@@ -54,7 +66,7 @@ func mailIssueCommentToParticipants(issue *Issue, doer *User, comment *Comment, 
 			continue
 		}
 
-		to, err := GetUserByID(watchers[i].UserID)
+		to, err := getUserByID(e, watchers[i].UserID)
 		if err != nil {
 			return fmt.Errorf("GetUserByID [%d]: %v", watchers[i].UserID, err)
 		}
@@ -76,7 +88,13 @@ func mailIssueCommentToParticipants(issue *Issue, doer *User, comment *Comment, 
 		names = append(names, participants[i].Name)
 	}
 
-	SendIssueCommentMail(issue, doer, comment, tos)
+	if err := issue.loadRepo(e); err != nil {
+		return err
+	}
+
+	for _, to := range tos {
+		SendIssueCommentMail(issue, doer, content, comment, []string{to})
+	}
 
 	// Mail mentioned people and exclude watchers.
 	names = append(names, doer.Name)
@@ -88,7 +106,12 @@ func mailIssueCommentToParticipants(issue *Issue, doer *User, comment *Comment, 
 
 		tos = append(tos, mentions[i])
 	}
-	SendIssueMentionMail(issue, doer, comment, GetUserEmailsByNames(tos))
+
+	emails := getUserEmailsByNames(e, tos)
+
+	for _, to := range emails {
+		SendIssueMentionMail(issue, doer, content, comment, []string{to})
+	}
 
 	return nil
 }
@@ -96,12 +119,16 @@ func mailIssueCommentToParticipants(issue *Issue, doer *User, comment *Comment, 
 // MailParticipants sends new issue thread created emails to repository watchers
 // and mentioned people.
 func (issue *Issue) MailParticipants() (err error) {
-	mentions := markdown.FindAllMentions(issue.Content)
-	if err = UpdateIssueMentions(x, issue.ID, mentions); err != nil {
+	return issue.mailParticipants(x)
+}
+
+func (issue *Issue) mailParticipants(e Engine) (err error) {
+	mentions := markup.FindAllMentions(issue.Content)
+	if err = UpdateIssueMentions(e, issue.ID, mentions); err != nil {
 		return fmt.Errorf("UpdateIssueMentions [%d]: %v", issue.ID, err)
 	}
 
-	if err = mailIssueCommentToParticipants(issue, issue.Poster, nil, mentions); err != nil {
+	if err = mailIssueCommentToParticipants(e, issue, issue.Poster, issue.Content, nil, mentions); err != nil {
 		log.Error(4, "mailIssueCommentToParticipants: %v", err)
 	}
 

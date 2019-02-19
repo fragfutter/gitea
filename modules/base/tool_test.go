@@ -1,11 +1,13 @@
 package base
 
 import (
+	"net/url"
 	"os"
 	"testing"
 	"time"
 
 	"code.gitea.io/gitea/modules/setting"
+
 	"github.com/Unknwon/i18n"
 	macaroni18n "github.com/go-macaron/i18n"
 	"github.com/stretchr/testify/assert"
@@ -105,12 +107,6 @@ func TestBasicAuthEncode(t *testing.T) {
 	assert.Equal(t, "Zm9vOmJhcg==", BasicAuthEncode("foo", "bar"))
 }
 
-func TestGetRandomString(t *testing.T) {
-	randomString, err := GetRandomString(4)
-	assert.NoError(t, err)
-	assert.Len(t, randomString, 4)
-}
-
 // TODO: Test PBKDF2()
 // TODO: Test VerifyTimeLimitCode()
 // TODO: Test CreateTimeLimitCode()
@@ -126,16 +122,40 @@ func TestHashEmail(t *testing.T) {
 	)
 }
 
-func TestAvatarLink(t *testing.T) {
+const gravatarSource = "https://secure.gravatar.com/avatar/"
+
+func disableGravatar() {
 	setting.EnableFederatedAvatar = false
 	setting.LibravatarService = nil
 	setting.DisableGravatar = true
+}
 
-	assert.Equal(t, "/img/avatar_default.png", AvatarLink(""))
-
+func enableGravatar(t *testing.T) {
 	setting.DisableGravatar = false
+	var err error
+	setting.GravatarSourceURL, err = url.Parse(gravatarSource)
+	assert.NoError(t, err)
+}
+
+func TestSizedAvatarLink(t *testing.T) {
+	disableGravatar()
+	assert.Equal(t, "/img/avatar_default.png",
+		SizedAvatarLink("gitea@example.com", 100))
+
+	enableGravatar(t)
 	assert.Equal(t,
-		"353cbad9b58e69c96154ad99f92bedc7",
+		"https://secure.gravatar.com/avatar/353cbad9b58e69c96154ad99f92bedc7?d=identicon&s=100",
+		SizedAvatarLink("gitea@example.com", 100),
+	)
+}
+
+func TestAvatarLink(t *testing.T) {
+	disableGravatar()
+	assert.Equal(t, "/img/avatar_default.png", AvatarLink("gitea@example.com"))
+
+	enableGravatar(t)
+	assert.Equal(t,
+		"https://secure.gravatar.com/avatar/353cbad9b58e69c96154ad99f92bedc7?d=identicon",
 		AvatarLink("gitea@example.com"),
 	)
 }
@@ -279,21 +299,21 @@ func TestFileSize(t *testing.T) {
 
 func TestSubtract(t *testing.T) {
 	toFloat64 := func(n interface{}) float64 {
-		switch n.(type) {
+		switch n := n.(type) {
 		case int:
-			return float64(n.(int))
+			return float64(n)
 		case int8:
-			return float64(n.(int8))
+			return float64(n)
 		case int16:
-			return float64(n.(int16))
+			return float64(n)
 		case int32:
-			return float64(n.(int32))
+			return float64(n)
 		case int64:
-			return float64(n.(int64))
+			return float64(n)
 		case float32:
-			return float64(n.(float32))
+			return float64(n)
 		case float64:
-			return n.(float64)
+			return n
 		default:
 			return 0.0
 		}

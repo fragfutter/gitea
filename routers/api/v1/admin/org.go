@@ -1,4 +1,5 @@
 // Copyright 2015 The Gogs Authors. All rights reserved.
+// Copyright 2019 The Gitea Authors. All rights reserved.
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
@@ -14,8 +15,31 @@ import (
 )
 
 // CreateOrg api for create organization
-// see https://github.com/gogits/go-gogs-client/wiki/Administration-Organizations#create-a-new-organization
 func CreateOrg(ctx *context.APIContext, form api.CreateOrgOption) {
+	// swagger:operation POST /admin/users/{username}/orgs admin adminCreateOrg
+	// ---
+	// summary: Create an organization
+	// consumes:
+	// - application/json
+	// produces:
+	// - application/json
+	// parameters:
+	// - name: username
+	//   in: path
+	//   description: username of the user that will own the created organization
+	//   type: string
+	//   required: true
+	// - name: organization
+	//   in: body
+	//   required: true
+	//   schema: { "$ref": "#/definitions/CreateOrgOption" }
+	// responses:
+	//   "201":
+	//     "$ref": "#/responses/Organization"
+	//   "403":
+	//     "$ref": "#/responses/forbidden"
+	//   "422":
+	//     "$ref": "#/responses/validationError"
 	u := user.GetUserByParams(ctx)
 	if ctx.Written() {
 		return
@@ -42,4 +66,32 @@ func CreateOrg(ctx *context.APIContext, form api.CreateOrgOption) {
 	}
 
 	ctx.JSON(201, convert.ToOrganization(org))
+}
+
+//GetAllOrgs API for getting information of all the organizations
+func GetAllOrgs(ctx *context.APIContext) {
+	// swagger:operation GET /admin/orgs admin adminGetAllOrgs
+	// ---
+	// summary: List all organizations
+	// produces:
+	// - application/json
+	// responses:
+	//   "200":
+	//     "$ref": "#/responses/OrganizationList"
+	//   "403":
+	//     "$ref": "#/responses/forbidden"
+	users, _, err := models.SearchUsers(&models.SearchUserOptions{
+		Type:     models.UserTypeOrganization,
+		OrderBy:  models.SearchOrderByAlphabetically,
+		PageSize: -1,
+	})
+	if err != nil {
+		ctx.Error(500, "SearchOrganizations", err)
+		return
+	}
+	orgs := make([]*api.Organization, len(users))
+	for i := range users {
+		orgs[i] = convert.ToOrganization(users[i])
+	}
+	ctx.JSON(200, &orgs)
 }

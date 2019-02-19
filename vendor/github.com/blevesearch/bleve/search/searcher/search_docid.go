@@ -15,10 +15,20 @@
 package searcher
 
 import (
+	"reflect"
+
 	"github.com/blevesearch/bleve/index"
 	"github.com/blevesearch/bleve/search"
 	"github.com/blevesearch/bleve/search/scorer"
+	"github.com/blevesearch/bleve/size"
 )
+
+var reflectStaticSizeDocIDSearcher int
+
+func init() {
+	var ds DocIDSearcher
+	reflectStaticSizeDocIDSearcher = int(reflect.TypeOf(ds).Size())
+}
 
 // DocIDSearcher returns documents matching a predefined set of identifiers.
 type DocIDSearcher struct {
@@ -28,18 +38,24 @@ type DocIDSearcher struct {
 }
 
 func NewDocIDSearcher(indexReader index.IndexReader, ids []string, boost float64,
-	explain bool) (searcher *DocIDSearcher, err error) {
+	options search.SearcherOptions) (searcher *DocIDSearcher, err error) {
 
 	reader, err := indexReader.DocIDReaderOnly(ids)
 	if err != nil {
 		return nil, err
 	}
-	scorer := scorer.NewConstantScorer(1.0, boost, explain)
+	scorer := scorer.NewConstantScorer(1.0, boost, options)
 	return &DocIDSearcher{
 		scorer: scorer,
 		reader: reader,
 		count:  len(ids),
 	}, nil
+}
+
+func (s *DocIDSearcher) Size() int {
+	return reflectStaticSizeDocIDSearcher + size.SizeOfPtr +
+		s.reader.Size() +
+		s.scorer.Size()
 }
 
 func (s *DocIDSearcher) Count() uint64 {

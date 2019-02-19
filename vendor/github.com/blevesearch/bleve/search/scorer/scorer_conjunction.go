@@ -15,39 +15,49 @@
 package scorer
 
 import (
+	"reflect"
+
 	"github.com/blevesearch/bleve/search"
+	"github.com/blevesearch/bleve/size"
 )
 
-type ConjunctionQueryScorer struct {
-	explain bool
+var reflectStaticSizeConjunctionQueryScorer int
+
+func init() {
+	var cqs ConjunctionQueryScorer
+	reflectStaticSizeConjunctionQueryScorer = int(reflect.TypeOf(cqs).Size())
 }
 
-func NewConjunctionQueryScorer(explain bool) *ConjunctionQueryScorer {
+type ConjunctionQueryScorer struct {
+	options search.SearcherOptions
+}
+
+func (s *ConjunctionQueryScorer) Size() int {
+	return reflectStaticSizeConjunctionQueryScorer + size.SizeOfPtr
+}
+
+func NewConjunctionQueryScorer(options search.SearcherOptions) *ConjunctionQueryScorer {
 	return &ConjunctionQueryScorer{
-		explain: explain,
+		options: options,
 	}
 }
 
 func (s *ConjunctionQueryScorer) Score(ctx *search.SearchContext, constituents []*search.DocumentMatch) *search.DocumentMatch {
 	var sum float64
 	var childrenExplanations []*search.Explanation
-	if s.explain {
+	if s.options.Explain {
 		childrenExplanations = make([]*search.Explanation, len(constituents))
 	}
 
-	locations := []search.FieldTermLocationMap{}
 	for i, docMatch := range constituents {
 		sum += docMatch.Score
-		if s.explain {
+		if s.options.Explain {
 			childrenExplanations[i] = docMatch.Expl
-		}
-		if docMatch.Locations != nil {
-			locations = append(locations, docMatch.Locations)
 		}
 	}
 	newScore := sum
 	var newExpl *search.Explanation
-	if s.explain {
+	if s.options.Explain {
 		newExpl = &search.Explanation{Value: sum, Message: "sum of:", Children: childrenExplanations}
 	}
 
@@ -55,11 +65,8 @@ func (s *ConjunctionQueryScorer) Score(ctx *search.SearchContext, constituents [
 	rv := constituents[0]
 	rv.Score = newScore
 	rv.Expl = newExpl
-	if len(locations) == 1 {
-		rv.Locations = locations[0]
-	} else if len(locations) > 1 {
-		rv.Locations = search.MergeLocations(locations)
-	}
+	rv.FieldTermLocations = search.MergeFieldTermLocations(
+		rv.FieldTermLocations, constituents[1:])
 
 	return rv
 }
